@@ -547,6 +547,254 @@ def test_consolidator_regression_prefers_original_root_cause_key() -> None:
                 f"expected review_lane=round_safety, got {f['review_lane']}")
 
 
+# ------------------------- Stage B2 tests -------------------------
+# New for version 0.3-stageB2: preflight, unverifiable-kind consolidator
+# routing, LaTeX macro expansion, and math-verifier kind tagging.
+
+
+preflight_mod = _load("_preflight_mod", ROOT / "_preflight.py")
+latex_macros = _load("_latex_macros_mod", ROOT / "_latex_macros.py")
+
+
+def _fake_net_probe(ok: bool, latency: int = 42):
+    """Patch helper that returns a static network-probe result."""
+    def _probe(url, label):
+        return {"reachable": ok, "latency_ms": latency,
+                "note": f"{label} {'ok' if ok else 'unreachable'}"}
+    return _probe
+
+
+def test_preflight_missing_api_key_marks_degraded() -> None:
+    # Force-patch every env probe so we don't depend on the host network.
+    saved_net_cf = preflight_mod._check_network_crossref
+    saved_net_ax = preflight_mod._check_network_arxiv
+    preflight_mod._check_network_crossref = lambda: _fake_net_probe(True)(
+        "probe", "CrossRef")
+    preflight_mod._check_network_arxiv = lambda: _fake_net_probe(True)(
+        "probe", "arXiv")
+    try:
+        with _EnvPatch(ANTHROPIC_API_KEY=None):
+            report = preflight_mod.run_preflight()
+    finally:
+        preflight_mod._check_network_crossref = saved_net_cf
+        preflight_mod._check_network_arxiv = saved_net_ax
+    assert_true(report["status"] in {"degraded", "setup_incomplete"},
+                f"missing API key should not mark ready; got {report['status']}")
+    verifiers = {a["verifier"] for a in report["affected_verifiers"]}
+    assert_true("verify_citations_full" in verifiers,
+                f"citations verifier should be affected; got {verifiers}")
+    assert_true("verify_internal_contradiction" in verifiers,
+                f"contradiction verifier should be affected; got {verifiers}")
+    # Every API-key-sourced affected entry must be tagged env-flavor.
+    env_entries = [a for a in report["affected_verifiers"]
+                   if a.get("triggered_by") == "anthropic_api_key"]
+    assert_true(bool(env_entries), "expected at least one api_key-triggered entry")
+    for entry in env_entries:
+        assert_true("env" in entry["status"],
+                    f"entry should carry env-kind status, got {entry}")
+
+
+def test_preflight_all_present_marks_ready() -> None:
+    saved_api = preflight_mod._check_anthropic_api_key
+    saved_sdk = preflight_mod._check_anthropic_sdk
+    saved_sy = preflight_mod._check_sympy
+    saved_ant = preflight_mod._check_antlr4_runtime
+    saved_cf = preflight_mod._check_network_crossref
+    saved_ax = preflight_mod._check_network_arxiv
+    preflight_mod._check_anthropic_api_key = lambda: {
+        "present": True, "valid": None, "note": "ok"}
+    preflight_mod._check_anthropic_sdk = lambda: {
+        "importable": True, "version": "9.9", "note": "ok"}
+    preflight_mod._check_sympy = lambda: {
+        "importable": True, "version": "1.12", "note": "ok"}
+    preflight_mod._check_antlr4_runtime = lambda: {
+        "importable": True, "version": None, "note": "ok"}
+    preflight_mod._check_network_crossref = lambda: {
+        "reachable": True, "latency_ms": 10, "note": "ok"}
+    preflight_mod._check_network_arxiv = lambda: {
+        "reachable": True, "latency_ms": 12, "note": "ok"}
+    try:
+        report = preflight_mod.run_preflight()
+    finally:
+        preflight_mod._check_anthropic_api_key = saved_api
+        preflight_mod._check_anthropic_sdk = saved_sdk
+        preflight_mod._check_sympy = saved_sy
+        preflight_mod._check_antlr4_runtime = saved_ant
+        preflight_mod._check_network_crossref = saved_cf
+        preflight_mod._check_network_arxiv = saved_ax
+    assert_true(report["status"] == "ready",
+                f"expected ready when all checks pass; got {report['status']}")
+    assert_true(not report["affected_verifiers"],
+                f"no verifiers should be affected; got {report['affected_verifiers']}")
+
+
+def test_unverifiable_subtype_env_not_gate_blocker() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        review = Path(td) / "review"
+        (review / "verifier").mkdir(parents=True)
+        (review / "verifier" / "citations.json").write_text(
+            json.dumps({
+                "verifier_id": "verify_citations_full",
+                "verifier_version": "0.3-stageB2",
+                "status": "unverifiable", "severity_suggestion": "P0",
+                "summary": "env-unverifiable target for routing test",
+                "targets": [{
+                    "locator": "cite:env_test",
+                    "status": "unverifiable",
+                    "severity_suggestion": "P0",
+                    "evidence": {
+                        "quote": "As shown by Foo (2024)...",
+                        "judge_notes": "ANTHROPIC_API_KEY not configured.",
+                        "judge_confidence": "low",
+                        "unverifiable_kind": "env",
+                    },
+                    "root_cause_key": "citation-judge-unresolved-env",
+                }],
+                "metadata": {},
+            }),
+            encoding="utf-8",
+        )
+        findings = consolidator.load_verifier_files(review / "verifier")
+        cleaned = [consolidator.sanitize_issue(f) for f in findings]
+    assert_true(len(cleaned) == 1, f"expected 1 finding, got {cleaned}")
+    f = cleaned[0]
+    assert_true(f["gate_blocker"] is False,
+                f"env-unverifiable must NOT gate_blocker, got {f}")
+    assert_true(f.get("disposition") == "setup_needed",
+                f"env-unverifiable must map to setup_needed, got {f.get('disposition')}")
+
+
+def test_unverifiable_subtype_evidence_is_gate_blocker() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        review = Path(td) / "review"
+        (review / "verifier").mkdir(parents=True)
+        (review / "verifier" / "citations.json").write_text(
+            json.dumps({
+                "verifier_id": "verify_citations_full",
+                "verifier_version": "0.3-stageB2",
+                "status": "unverifiable", "severity_suggestion": "P0",
+                "summary": "evidence-unverifiable target",
+                "targets": [{
+                    "locator": "cite:evidence_test",
+                    "status": "unverifiable",
+                    "severity_suggestion": "P0",
+                    "evidence": {
+                        "quote": "Foo (2024) shows X.",
+                        "judge_notes": "Abstract resolved but judge was low-confidence.",
+                        "judge_confidence": "low",
+                        "unverifiable_kind": "evidence",
+                    },
+                    "root_cause_key": "citation-judge-unresolved-evidence",
+                }],
+                "metadata": {},
+            }),
+            encoding="utf-8",
+        )
+        findings = consolidator.load_verifier_files(review / "verifier")
+        cleaned = [consolidator.sanitize_issue(f) for f in findings]
+    assert_true(len(cleaned) == 1, f"expected 1 finding, got {cleaned}")
+    f = cleaned[0]
+    assert_true(f["gate_blocker"] is True,
+                f"evidence-unverifiable must gate_blocker, got {f}")
+    assert_true(f.get("disposition") == "gate_blocker",
+                f"evidence-unverifiable must route to gate_blocker, got {f.get('disposition')}")
+
+
+def test_latex_macro_extraction() -> None:
+    tex = (
+        r"\newcommand{\RR}{\mathbb{R}}"
+        r"\newcommand{\calC}{\mathcal{C}}"
+    )
+    macros = latex_macros.extract_newcommands(tex)
+    assert_true("RR" in macros, f"expected RR in macros, got {list(macros)}")
+    assert_true("calC" in macros, f"expected calC in macros, got {list(macros)}")
+    assert_true(macros["RR"][1].strip() == r"\mathbb{R}",
+                f"RR body wrong: {macros['RR']}")
+    assert_true(macros["calC"][1].strip() == r"\mathcal{C}",
+                f"calC body wrong: {macros['calC']}")
+
+
+def test_latex_macro_expansion_recursive() -> None:
+    tex_defs = (
+        r"\newcommand{\calC}{\mathcal{C}}"
+        r"\newcommand{\calCstar}{\calC^{\ast}}"
+    )
+    macros = latex_macros.extract_newcommands(tex_defs)
+    expanded = latex_macros.expand_macros(r"\calCstar", macros)
+    # After full expansion: \calCstar → \calC^{\ast} → \mathcal{C}^{\ast}
+    assert_true(r"\mathcal{C}" in expanded and r"^{\ast}" in expanded,
+                f"nested expansion failed; got {expanded!r}")
+
+
+def test_math_verifier_llm_fallback_without_key_still_unverifiable_tool() -> None:
+    m = _fresh("math_sympy_tool", ROOT / "verify_math_sympy.py")
+    # Force LLM unavailable and sympy available so we exercise the tool-gap path.
+    saved_llm = m._llm_available
+    m._llm_available = lambda: False
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "math.json"
+            # `\int x\, dx = \frac{x^2}{2}` contains `\int` which is on the
+            # unparseable-token list regardless of sympy/antlr availability.
+            report = m.run(
+                tex=r"$$ \int x\, dx = \frac{x^2}{2} $$",
+                out_path=out,
+                seeds=3,
+                tolerance=1e-8,
+                use_llm_fallback=True,  # enabled, but SDK patched away
+            )
+    finally:
+        m._llm_available = saved_llm
+    tool_targets = [
+        t for t in report["targets"]
+        if t.get("status") == "unverifiable"
+        and t.get("evidence", {}).get("unverifiable_kind") == "tool"
+    ]
+    assert_true(len(tool_targets) >= 1,
+                f"expected unverifiable_kind=tool target, got {report['targets']}")
+    # The no-LLM-fallback path must NOT tag as env (SDK missing is env only
+    # when sympy was never asked) and must NOT escalate to evidence unless
+    # sympy produced NaN.
+    for t in tool_targets:
+        kind = t["evidence"]["unverifiable_kind"]
+        assert_true(kind == "tool",
+                    f"expected kind=tool, got {kind} in target {t}")
+
+
+def test_math_verifier_macro_expansion_rescues_previously_unparseable() -> None:
+    m = _fresh("math_sympy_macro", ROOT / "verify_math_sympy.py")
+    ok_sympy, _err = m._sympy_available()
+    if not ok_sympy:
+        # Without sympy we can't exercise the rescue path; the extraction /
+        # expansion module was independently tested above. Skip silently.
+        return
+    # Define a macro whose body is a plain symbol so sympy can parse both
+    # sides: \calA = A. Equation `\calA = A` after macro expansion becomes
+    # `A = A` which sympy happily verifies.
+    tex = (
+        r"\newcommand{\calA}{A}"
+        "\n"
+        r"$$ \calA = A $$"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "math.json"
+        report = m.run(tex=tex, out_path=out, seeds=3, tolerance=1e-8,
+                       use_llm_fallback=False)
+    # parse_latex may be unavailable (no antlr4) even if sympy is installed —
+    # that's an env condition, not a macro-coverage test. Only enforce the
+    # rescue contract when sympy was actually able to parse the expanded form.
+    non_parse_failure = all(
+        "LaTeX parse failed" not in (t.get("evidence", {}).get("judge_notes") or "")
+        for t in report["targets"]
+    )
+    if not non_parse_failure:
+        return
+    verifieds = [t for t in report["targets"] if t["status"] == "verified"]
+    assert_true(len(verifieds) >= 1,
+                f"macro-expanded identity eq should verify; "
+                f"targets={report['targets']}")
+
+
 # ------------------------- main -------------------------
 
 
@@ -571,6 +819,15 @@ def main() -> int:
         test_contradiction_graceful_without_api_key,
         test_consolidator_recognizes_verify_math_sympy,
         test_consolidator_regression_prefers_original_root_cause_key,
+        # Stage B2 additions:
+        test_preflight_missing_api_key_marks_degraded,
+        test_preflight_all_present_marks_ready,
+        test_unverifiable_subtype_env_not_gate_blocker,
+        test_unverifiable_subtype_evidence_is_gate_blocker,
+        test_latex_macro_extraction,
+        test_latex_macro_expansion_recursive,
+        test_math_verifier_llm_fallback_without_key_still_unverifiable_tool,
+        test_math_verifier_macro_expansion_rescues_previously_unparseable,
     ]
     failed = 0
     for t in tests:

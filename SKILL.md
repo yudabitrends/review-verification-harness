@@ -3,7 +3,7 @@ name: review-verification-harness
 description: Script-backed verification primitives for academic paper review. Converts "LLM-thinks-it's-right" review comments into evidence-grounded verdicts by resolving DOIs, fetching abstracts, running sympy on equations, cross-section contradiction detection, and round-over-round regression checking. Invoked by `paper-audit`, `convergent-peer-review`, and `academic-pipeline` to back up CRITICAL findings with machine-verifiable evidence. Pairs with `ai-validation-blindspots` (R4 adversarial probes) to form the ≤5-round submission gate.
 type: verification-harness
 argument-hint: "[<paper.tex>] [--bib <paper.bib>] [--workspace <dir>] [--fast]"
-version: 0.2-stageB
+version: 0.3-stageB2
 ---
 
 # review-verification-harness
@@ -13,10 +13,16 @@ version: 0.2-stageB
 The review pipeline historically treats reviewer opinions as ground truth. A CRITICAL finding from a reviewer ("this citation doesn't support the claim", "this equation has a sign error", "abstract overclaims") is trusted, not verified. This harness converts those judgments into script-backed evidence, and distinguishes three verdict states:
 
 - **verified** — a script or API call confirms the finding is real
-- **unverifiable** — evidence-gathering was inconclusive; **treat as P0**
+- **unverifiable** — evidence-gathering was inconclusive
 - **failed** — the claimed finding was disproven
 
-**Design rule:** `unverifiable` is never equivalent to `pass`. If a verifier cannot check, the paper is not ready to ship.
+**Design rule:** `unverifiable` is never equivalent to `pass`. If a verifier cannot check, the paper is not ready to ship — BUT since v0.3-stageB2 every `unverifiable` target carries an `evidence.unverifiable_kind` subtype:
+
+- `env` — host misconfiguration (missing API key, unreachable network, missing dep). Consumer routes to **`setup_needed`**, not `gate_blocker`. Fix the host, re-run.
+- `tool` — the verifier's tool doesn't cover this target (sympy parser gap, custom macro, regex limit). Consumer routes to **`human_review_recommended`**, not `gate_blocker`. A human should eyeball the target.
+- `evidence` — we ran the check and the evidence was genuinely inconclusive (DOI resolved but abstract empty, LLM judge low-confidence, seeds produced NaN). Consumer routes to **`gate_blocker`** — this is the original P0 upgrade case.
+
+This taxonomy fixes the false-P0 drowning failure mode in the ESORICS run: 80 of 81 unverifiable targets were `env`/`tool`; only 1 was genuine `evidence`.
 
 ## Stage A + B verifiers (this release)
 
@@ -119,9 +125,26 @@ Two complementary layers:
 
 Blindspots skill's Classes 9–11 (empirical rigor / reproducibility / figure integrity) cover the rows that harness Stages A+B don't yet script-verify. A paper that passes both layers has concrete evidence for the check-able classes and adversarial pressure-tested the rest.
 
+## Environment requirements
+
+Stage B2 preflight (`scripts/_preflight.py`) checks these before any verifier runs. `run_round.sh` invokes preflight by default; `--skip-preflight` bypasses.
+
+| Dependency | Needed by | Kind if missing | Impact |
+|---|---|---|---|
+| `ANTHROPIC_API_KEY` env var | `verify_citations_full`, `verify_internal_contradiction`, LLM math fallback | **env** | Top-level `unverifiable`; consumer routes to `setup_needed` (not gate_blocker). |
+| `anthropic` Python SDK | same as above | **env** | Same — fixable with `pip install anthropic`. |
+| `sympy` | `verify_math_sympy` | **env** | Top-level `unverifiable`. Install with `pip install sympy`. |
+| `antlr4-python3-runtime` | `verify_math_sympy` LaTeX parser | **tool** | Per-equation `unverifiable_kind=tool`. Install with `pip install antlr4-python3-runtime`. |
+| CrossRef reachability | `verify_citations_full` DOI resolve | **env** | Network-blocked runs downgrade unresolvable citations to `unverifiable_kind=env`. |
+| arXiv reachability | `verify_citations_full` arXiv fallback | **env** | Same; Semantic Scholar may still cover. |
+
+Run `python3 scripts/_preflight.py` to get a human-readable diagnostic and a JSON report. Exit code 0 = ready, 1 = degraded (safe to run, expect env-tagged unverifiable), 2 = setup_incomplete (don't run).
+
 ## Philosophy
 
 Verifiers **fail loud, not fail quiet**. When in doubt, return `unverifiable`. Never return `verified` based only on LLM reasoning without external evidence. Coverage-for-certainty is the right trade: flagging 10 findings as unverifiable (human must check) beats falsely certifying 1 as verified.
+
+Stage B2 clarifies: `unverifiable ≠ pass` still holds, but the three-state taxonomy means `unverifiable_kind=env|tool` are NOT paper defects — they are setup/coverage gaps. Only `unverifiable_kind=evidence` maps to a gate-blocking P0. This is the fix for the false-P0 drowning failure mode the ESORICS conference-paper run exposed.
 
 ## Failure modes
 

@@ -52,6 +52,9 @@ OPTIONS:
   --force          Allow overwriting an existing workspace/r<N>/ directory.
                    WITHOUT this flag, the script refuses to proceed if the
                    round workspace already exists (prevents dirty mixes).
+  --skip-preflight Skip the Stage-B2 preflight health check (not recommended —
+                   preflight distinguishes env vs paper-defect unverifiable
+                   kinds and avoids drowning real signal in setup noise).
 
 OUTPUTS:
   workspace/r<N>/tex/paper.tex
@@ -106,6 +109,7 @@ BIB=""
 WORKSPACE="workspace"
 FAST_FLAG=""
 FORCE=0
+SKIP_PREFLIGHT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -117,6 +121,8 @@ while [[ $# -gt 0 ]]; do
             FAST_FLAG="--fast"; shift ;;
         --force)
             FORCE=1; shift ;;
+        --skip-preflight)
+            SKIP_PREFLIGHT=1; shift ;;
         *)
             echo "error: unknown option '$1'" >&2
             echo "run 'bash run_round.sh --help' for usage." >&2
@@ -155,6 +161,47 @@ if [[ -e "$ROUND_DIR" ]]; then
 fi
 
 mkdir -p "$ROUND_DIR/tex" "$ROUND_DIR/claims" "$ROUND_DIR/verifier"
+
+# --- 1.5 Preflight health check (Stage B2) ---------------------------------
+# Distinguish env/tool unverifiable from true evidence gaps; writes its JSON
+# report into workspace/r<N>/verifier/_preflight.json so the consolidator
+# and downstream reports can see it. We always write the JSON even when
+# --skip-preflight is set so the consumer can detect that the user explicitly
+# opted out (no file ⇒ ran old harness; file with status=skipped ⇒ skipped).
+
+PREFLIGHT_JSON="$ROUND_DIR/verifier/_preflight.json"
+if [[ $SKIP_PREFLIGHT -eq 1 ]]; then
+    echo "[run_round] --skip-preflight: bypassing environment health check" >&2
+    python3 - <<PY > "$PREFLIGHT_JSON"
+import json
+print(json.dumps({"status": "skipped",
+                  "summary": "preflight skipped by --skip-preflight",
+                  "checks": {}, "affected_verifiers": []}, indent=2))
+PY
+else
+    echo "[run_round] running preflight health check ..."
+    set +e
+    python3 "$SCRIPTS_DIR/_preflight.py" --out "$PREFLIGHT_JSON"
+    PREFLIGHT_RC=$?
+    set -e
+    if [[ $PREFLIGHT_RC -eq 0 ]]; then
+        : # ready
+    elif [[ $PREFLIGHT_RC -eq 1 ]]; then
+        echo "" >&2
+        echo "[run_round] WARNING: preflight reports degraded environment;" >&2
+        echo "            some verifiers will return unverifiable_kind=env" >&2
+        echo "            (NOT gate_blocker; see _preflight.json)." >&2
+        echo "" >&2
+    elif [[ $PREFLIGHT_RC -eq 2 ]]; then
+        echo "" >&2
+        echo "[run_round] FATAL: preflight reports setup_incomplete; aborting." >&2
+        echo "            Fix the missing deps listed above and re-run." >&2
+        exit 2
+    else
+        echo "[run_round] warning: preflight crashed with rc=$PREFLIGHT_RC;" >&2
+        echo "            proceeding without environment diagnostics." >&2
+    fi
+fi
 
 # --- 2. Snapshot tex ---------------------------------------------------------
 

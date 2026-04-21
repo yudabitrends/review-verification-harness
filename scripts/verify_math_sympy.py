@@ -5,28 +5,43 @@ Catches silent algebra, sign, and identity errors in displayed equations
 almost never catch these; sympy does so reliably.
 
 Pipeline:
-  1. Extract displayed equations from a LaTeX file
+  1. Extract \\newcommand / \\def definitions from the full tex and expand
+     them inside each equation's LHS/RHS before sympy parsing (so \\calC,
+     \\RR, \\opE etc. become their underlying tex).
+  2. Extract displayed equations from a LaTeX file
      (`\\[..\\]`, `$$..$$`, equation/align/eqnarray/gather/multline envs,
      align/eqnarray/gather bodies are split on `\\\\`).
-  2. Split each on top-level `=` into (lhs, rhs) pairs. Multi-step chains
+  3. Split each on top-level `=` into (lhs, rhs) pairs. Multi-step chains
      `A = B = C` become `(A,B)` and `(B,C)`. Skip `:=`, `==`, and `=` nested
      inside braces/brackets/parens (so `x_{i=1}` is safe).
-  3. For each pair, parse both sides with `sympy.parsing.latex.parse_latex`.
+  4. For each pair, parse both sides with `sympy.parsing.latex.parse_latex`.
      a. Try symbolic `simplify(lhs - rhs) == 0`.
      b. If inconclusive, draw `--seeds` (default 3) random real-valued
         substitutions for free symbols in [0.1, 2.0] with a seeded RNG,
         compare with relative tolerance.
      c. On failure, test sign-flip heuristic `simplify(lhs + rhs) == 0` and
         report "sign-flip detected".
+  5. When sympy can't parse or the result is inconclusive AND
+     ANTHROPIC_API_KEY is set (and `--no-llm-math-fallback` is NOT passed),
+     consult an LLM judge as a last resort. The LLM is told explicitly this
+     is NOT a proof — only a plausibility screen — so it is biased toward
+     "uncertain" on specific quantitative claims it cannot reason through.
+     Cost: ~2k tokens per equation, Sonnet-tier.
+
+Every unverifiable target now carries `evidence.unverifiable_kind` one of
+`env`, `tool`, or `evidence` so downstream consumers can distinguish host
+misconfiguration (env) from tool-coverage gaps (tool) from genuinely
+inconclusive evidence (evidence — the only one that still maps to P0).
 
 Graceful degradation: if sympy cannot be imported, emit a top-level
-`status=unverifiable` severity `P0`. A per-equation exception is caught and
-the target is marked `unverifiable` — a single bad equation never crashes
-the run. Output conforms to `references/VERIFIER_CONTRACT.md`.
+`status=unverifiable` severity `P0` with `unverifiable_kind=env`. A
+per-equation exception is caught and the target is marked `unverifiable`
+with the right subtype. Output conforms to `references/VERIFIER_CONTRACT.md`.
 
 Usage:
     python verify_math_sympy.py --tex paper.tex --out workspace/verifier/math.json
     python verify_math_sympy.py --tex paper.tex --out math.json --seeds 5 --tolerance 1e-6
+    python verify_math_sympy.py --tex paper.tex --out math.json --no-llm-math-fallback
 """
 
 from __future__ import annotations
@@ -34,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import signal
@@ -43,8 +59,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Local helper: \newcommand / \def expansion, shared with the rest of the
+# harness. Imported defensively — if the module is missing the verifier still
+# runs, it just skips macro expansion and tags per-equation notes.
+try:
+    from _latex_macros import extract_newcommands, safe_expand  # type: ignore
+except ImportError:  # running from a different cwd
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from _latex_macros import extract_newcommands, safe_expand  # type: ignore
+    except ImportError:  # pragma: no cover — defensive fallback
+        extract_newcommands = None  # type: ignore
+        safe_expand = None  # type: ignore
+
 VERIFIER_ID = "verify_math_sympy"
-VERIFIER_VERSION = "0.1"
+VERIFIER_VERSION = "0.3-stageB2"
 
 
 class _SympyTimeout(Exception):
@@ -103,6 +132,119 @@ def _sympy_available() -> tuple[bool, str | None]:
         return False, f"sympy missing: {exc}"
     except Exception as exc:  # noqa: BLE001
         return False, f"sympy unavailable: {exc}"
+
+
+def _llm_available() -> bool:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return False
+    try:
+        import anthropic  # type: ignore  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_LLM_MATH_SYSTEM = """You are a careful mathematical-notation auditor.
+
+You are given a single equation from an academic paper and a short surrounding
+context. You MUST NOT attempt to prove the equation — you cannot. Your ONLY
+job is a plausibility check:
+
+- Do LHS and RHS have compatible shape / types / dimensions?
+- Is there any obvious sign flip, missing factor, or mis-use of a bound
+  symbol that a human auditor would spot in under ten seconds?
+
+Respond ONLY with a JSON object:
+{
+  "verdict": "plausible" | "implausible" | "uncertain",
+  "confidence": "high" | "medium" | "low",
+  "reason": "one sentence pointing at the specific shape/sign/factor you checked"
+}
+
+Be paranoid. If the equation contains notation you do not recognise or a
+derivation step you cannot verify, return `uncertain`. `plausible` only when
+every side's shape checks out AND you see no obvious error.
+
+This is NOT a proof. Do NOT return `plausible` just because the equation
+looks like familiar algebra — confirm the shapes first."""
+
+
+def _llm_math_judge(
+    lhs: str,
+    rhs: str,
+    context: str,
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Ask Claude whether LHS = RHS is plausibly correct given paper context.
+
+    Returns a dict ``{verdict, confidence, reason, model, input_tokens,
+    output_tokens, stub}``. ``stub=True`` means the LLM was not reachable and
+    the verdict is a safe default (uncertain / low).
+    """
+    if not _llm_available():
+        return {
+            "verdict": "uncertain", "confidence": "low",
+            "reason": ("ANTHROPIC_API_KEY not set or `anthropic` SDK missing; "
+                       "LLM math fallback unavailable."),
+            "model": None, "input_tokens": 0, "output_tokens": 0, "stub": True,
+        }
+    try:
+        import anthropic  # type: ignore
+    except ImportError:  # pragma: no cover — already checked
+        return {
+            "verdict": "uncertain", "confidence": "low",
+            "reason": "anthropic SDK not importable", "model": None,
+            "input_tokens": 0, "output_tokens": 0, "stub": True,
+        }
+    client = anthropic.Anthropic()
+    chosen_model = model or os.environ.get("REVIEW_VERIFIER_MODEL", "claude-sonnet-4-6")
+    user = (
+        f"Surrounding paper context (trimmed):\n---\n{context[:1200]}\n---\n\n"
+        f"Equation LHS (LaTeX): {lhs[:300]}\n"
+        f"Equation RHS (LaTeX): {rhs[:300]}\n\n"
+        "Return the JSON verdict now."
+    )
+    try:
+        resp = client.messages.create(
+            model=chosen_model,
+            max_tokens=300,
+            temperature=0,
+            system=_LLM_MATH_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+        )
+        body = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        )
+        in_tok = int(getattr(resp.usage, "input_tokens", 0) or 0)
+        out_tok = int(getattr(resp.usage, "output_tokens", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": "uncertain", "confidence": "low",
+            "reason": f"LLM call error: {exc}", "model": chosen_model,
+            "input_tokens": 0, "output_tokens": 0, "stub": False,
+        }
+    match = re.search(r"\{.*\}", body, flags=re.DOTALL)
+    data: dict[str, Any] = {}
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            data = {}
+    verdict = data.get("verdict")
+    if verdict not in {"plausible", "implausible", "uncertain"}:
+        verdict = "uncertain"
+    conf = data.get("confidence")
+    if conf not in {"high", "medium", "low"}:
+        conf = "low"
+    return {
+        "verdict": verdict,
+        "confidence": conf,
+        "reason": str(data.get("reason", ""))[:400] or "no reason returned",
+        "model": chosen_model,
+        "input_tokens": in_tok, "output_tokens": out_tok,
+        "stub": False,
+    }
 
 
 # ----------------------------- LaTeX equation extraction -----------------------------
@@ -236,7 +378,13 @@ def verify_pair(
     lhs_tex: str, rhs_tex: str, *,
     seeds: int, tolerance: float, rng: random.Random,
 ) -> dict[str, Any]:
-    """Parse both sides, try symbolic check, then numerical. Return a detail dict."""
+    """Parse both sides, try symbolic check, then numerical. Return a detail dict.
+
+    The returned ``detail`` carries ``tool_path`` ('sympy' or 'none') and
+    ``unverifiable_kind`` one of 'env', 'tool', or 'evidence' when
+    ``status == 'unverifiable'``. ``parse_failed`` is True when parse_latex
+    refused — upstream may then fall back to an LLM judge.
+    """
     import sympy  # type: ignore
     from sympy.parsing.latex import parse_latex  # type: ignore
 
@@ -245,17 +393,28 @@ def verify_pair(
         "lhs": None, "rhs": None, "free_symbols": [],
         "symbolic_equal": None, "seeds_evaluated": 0, "seed_results": [],
         "sign_flip_detected": False, "status": "unverifiable", "judge_notes": "",
+        "tool_path": "sympy", "parse_failed": False,
+        "unverifiable_kind": None,
     }
     try:
         lhs_expr = parse_latex(lhs_tex)
     except Exception as exc:  # noqa: BLE001
-        detail["judge_notes"] = f"LaTeX parse failed on LHS: {exc}"; return detail
+        detail["judge_notes"] = f"LaTeX parse failed on LHS: {exc}"
+        detail["parse_failed"] = True
+        detail["unverifiable_kind"] = "tool"
+        return detail
     try:
         rhs_expr = parse_latex(rhs_tex)
     except Exception as exc:  # noqa: BLE001
-        detail["judge_notes"] = f"LaTeX parse failed on RHS: {exc}"; return detail
+        detail["judge_notes"] = f"LaTeX parse failed on RHS: {exc}"
+        detail["parse_failed"] = True
+        detail["unverifiable_kind"] = "tool"
+        return detail
     if lhs_expr is None or rhs_expr is None:
-        detail["judge_notes"] = "parse_latex returned None for one side"; return detail
+        detail["judge_notes"] = "parse_latex returned None for one side"
+        detail["parse_failed"] = True
+        detail["unverifiable_kind"] = "tool"
+        return detail
     detail["lhs"], detail["rhs"] = str(lhs_expr), str(rhs_expr)
 
     try:
@@ -315,6 +474,7 @@ def verify_pair(
 
     if not finite_seed_seen:
         detail["status"] = "unverifiable"
+        detail["unverifiable_kind"] = "evidence"
         detail["judge_notes"] = _join_notes(
             detail["judge_notes"],
             "all numerical seeds produced NaN/inf/complex values; cannot decide",
@@ -373,10 +533,21 @@ def _collapse_ws(text: str) -> str:
 def build_target(
     index: int, eq_item: dict[str, Any], pair_idx: int, detail: dict[str, Any],
 ) -> dict[str, Any]:
-    severity = {"verified": "minor", "failed": "P0", "unverifiable": "P0"}.get(detail["status"], "major")
+    status = detail["status"]
+    # Severity map: only `unverifiable_kind=evidence` gets P0. env/tool
+    # unverifiable are major but downstream routes them to non-gate_blocker
+    # dispositions (setup_needed / human_review_recommended) — see
+    # references/VERIFIER_CONTRACT.md.
+    if status == "verified":
+        severity = "minor"
+    elif status == "failed":
+        severity = "P0"
+    else:
+        kind = detail.get("unverifiable_kind") or "evidence"
+        severity = "P0" if kind == "evidence" else "major"
     locator = f"eq:{index}" if pair_idx == 0 else f"eq:{index}.{pair_idx}"
     sign_note = " (sign-flip heuristic matched)" if detail.get("sign_flip_detected") else ""
-    evidence = {
+    evidence: dict[str, Any] = {
         "quote": _collapse_ws(eq_item["raw"])[:MAX_EQ_QUOTE_CHARS],
         "lhs": detail.get("lhs"), "rhs": detail.get("rhs"),
         "lhs_tex": detail.get("lhs_tex"), "rhs_tex": detail.get("rhs_tex"),
@@ -386,25 +557,88 @@ def build_target(
         "seed_results": detail.get("seed_results", []),
         "sign_flip_detected": detail.get("sign_flip_detected", False),
         "judge_notes": (detail.get("judge_notes") or "") + sign_note,
-        "judge_confidence": "high" if detail["status"] == "failed" else "medium",
+        "judge_confidence": "high" if status == "failed" else "medium",
         "finding_kind": "equation_algebra",
+        "judge_method": detail.get("judge_method", "sympy"),
     }
+    if detail.get("macro_expansion_note"):
+        evidence["macro_expansion_note"] = detail["macro_expansion_note"]
+    if detail.get("macro_expanded"):
+        evidence["macro_expanded"] = True
+    if detail.get("llm_judge") is not None:
+        evidence["llm_judge"] = detail["llm_judge"]
+    if status == "unverifiable":
+        evidence["unverifiable_kind"] = detail.get("unverifiable_kind") or "evidence"
     return {
-        "locator": locator, "status": detail["status"],
+        "locator": locator, "status": status,
         "severity_suggestion": severity, "evidence": evidence,
-        "root_cause_key": f"math-sympy-{detail['status']}-{index}-{pair_idx}",
+        "root_cause_key": f"math-sympy-{status}-{index}-{pair_idx}",
     }
+
+
+def _apply_llm_verdict(target: dict[str, Any], judge: dict[str, Any]) -> None:
+    """Mutate a target dict based on an LLM judge verdict (fallback path).
+
+    Maps:
+      plausible + high/medium → status=verified, severity=minor, judge_method=llm_fallback
+      implausible → status=failed, severity=major (LLM is not authoritative)
+      uncertain → status stays unverifiable, unverifiable_kind=evidence
+    """
+    verdict = judge.get("verdict", "uncertain")
+    conf = judge.get("confidence", "low")
+    ev = target.setdefault("evidence", {})
+    ev["judge_method"] = "llm_fallback"
+    ev["llm_verdict"] = verdict
+    ev["llm_confidence"] = conf
+    ev["llm_reason"] = judge.get("reason", "")
+    if judge.get("model"):
+        ev["llm_model"] = judge["model"]
+    if verdict == "plausible" and conf in {"high", "medium"}:
+        target["status"] = "verified"
+        target["severity_suggestion"] = "minor"
+        ev.pop("unverifiable_kind", None)
+    elif verdict == "implausible":
+        target["status"] = "failed"
+        target["severity_suggestion"] = "major"
+        ev.pop("unverifiable_kind", None)
+    else:
+        target["status"] = "unverifiable"
+        target["severity_suggestion"] = "P0"
+        ev["unverifiable_kind"] = "evidence"
+
+
+def _apply_llm_verdict_to_detail(detail: dict[str, Any], judge: dict[str, Any]) -> None:
+    """Same semantics as `_apply_llm_verdict` but for the pre-target `detail` dict."""
+    verdict = judge.get("verdict", "uncertain")
+    conf = judge.get("confidence", "low")
+    detail["judge_method"] = "llm_fallback"
+    detail["judge_notes"] = _join_notes(
+        detail.get("judge_notes", ""),
+        f"LLM fallback: verdict={verdict} conf={conf} — {judge.get('reason','')}",
+    )
+    if verdict == "plausible" and conf in {"high", "medium"}:
+        detail["status"] = "verified"
+        detail["unverifiable_kind"] = None
+    elif verdict == "implausible":
+        detail["status"] = "failed"
+        detail["unverifiable_kind"] = None
+    else:
+        detail["status"] = "unverifiable"
+        detail["unverifiable_kind"] = "evidence"
 
 
 def _skip_target(
     idx: int, pair_idx: int, item: dict[str, Any], reason: str,
     lhs_tex: str | None = None, rhs_tex: str | None = None,
+    *, unverifiable_kind: str = "tool",
 ) -> dict[str, Any]:
     locator = f"eq:{idx}" if pair_idx == 0 else f"eq:{idx}.{pair_idx}"
+    severity = "P0" if unverifiable_kind == "evidence" else "major"
     evidence: dict[str, Any] = {
         "quote": _collapse_ws(item["raw"])[:MAX_EQ_QUOTE_CHARS],
         "judge_notes": reason, "judge_confidence": "medium",
         "finding_kind": "unparseable",
+        "unverifiable_kind": unverifiable_kind,
     }
     if lhs_tex is not None:
         evidence["lhs_tex"] = lhs_tex[:MAX_EQ_QUOTE_CHARS]
@@ -412,7 +646,7 @@ def _skip_target(
         evidence["rhs_tex"] = rhs_tex[:MAX_EQ_QUOTE_CHARS]
     return {
         "locator": locator, "status": "unverifiable",
-        "severity_suggestion": "P0", "evidence": evidence,
+        "severity_suggestion": severity, "evidence": evidence,
         "root_cause_key": f"math-sympy-unparseable-{idx}-{pair_idx}",
     }
 
@@ -428,23 +662,68 @@ def run(
     tolerance: float,
     per_equation_timeout_seconds: int = 5,
     max_equations: int = 500,
+    use_macro_expansion: bool = True,
+    use_llm_fallback: bool = True,
 ) -> dict[str, Any]:
     ok, err = _sympy_available()
     if not ok:
+        # Distinguish env vs evidence at the top level. sympy missing or
+        # antlr4 missing → env. Any other import failure → evidence.
+        kind = "env" if err and (
+            "sympy missing" in err or "antlr4" in (err or "").lower()
+            or "import" in (err or "").lower()
+        ) else "evidence"
+        # Top-level severity stays P0 to preserve the contract "unverifiable
+        # is never silently a pass" — consumers routing by unverifiable_kind
+        # will still correctly demote this to setup_needed / non-gate-blocker.
+        fallback_target = {
+            "locator": "eq:preflight",
+            "status": "unverifiable",
+            "severity_suggestion": "P0",
+            "evidence": {
+                "quote": "",
+                "judge_notes": f"sympy unavailable ({err}); cannot verify equation algebra.",
+                "judge_confidence": "medium",
+                "finding_kind": "sympy_unavailable",
+                "unverifiable_kind": kind,
+            },
+            "root_cause_key": "math-sympy-unavailable",
+        }
         report = _build_report(
-            status="unverifiable", severity="P0",
+            status="unverifiable",
+            severity="P0",
             summary=f"sympy unavailable ({err}); cannot verify equation algebra",
-            targets=[], tex_len=len(tex), seeds=seeds, tolerance=tolerance,
-            n_items=0, sympy_ok=False, errors=[err or "sympy import failed"],
+            targets=[fallback_target],
+            tex_len=len(tex), seeds=seeds, tolerance=tolerance,
+            n_items=0, sympy_ok=False,
+            errors=[err or "sympy import failed"],
+            tools_used={"none": 1},
+            llm_fallback_enabled=False,
+            macro_expansion_enabled=False,
         )
         _write(out_path, report)
         return report
+
+    # --- Macro extraction (once per paper) ---
+    macros: dict[str, tuple[int, str]] = {}
+    macro_error: str | None = None
+    if use_macro_expansion and extract_newcommands is not None:
+        try:
+            macros = extract_newcommands(tex)
+        except Exception as exc:  # noqa: BLE001
+            macro_error = f"macro extraction failed: {exc}"
 
     items = extract_equations(tex)
     rng = random.Random(RNG_SEED)
     targets: list[dict[str, Any]] = []
     errors: list[str] = []
+    if macro_error:
+        errors.append(macro_error)
     counts = {"verified": 0, "failed": 0, "unverifiable": 0}
+    tools_used: dict[str, int] = {
+        "sympy": 0, "sympy_with_macros": 0, "llm_fallback": 0, "none": 0,
+    }
+    llm_available = use_llm_fallback and _llm_available()
 
     if len(items) > max_equations:
         errors.append(
@@ -453,28 +732,62 @@ def run(
         )
         items = items[:max_equations]
 
+    def _expand(text: str) -> tuple[str, str | None]:
+        if not macros or safe_expand is None:
+            return text, None
+        return safe_expand(text, macros)
+
     for idx, item in enumerate(items):
         body = item["body"]
         if is_definition(body):
-            targets.append(_skip_target(
+            tgt = _skip_target(
                 idx, 0, item,
                 reason="equation is a definition (:=, \\equiv, \\coloneqq); skipping",
-            ))
+                unverifiable_kind="tool",
+            )
+            targets.append(tgt)
             counts["unverifiable"] += 1
+            tools_used["none"] += 1
             continue
         body_hits = unparseable_hits(body)
         pairs = split_equalities(body)
         if not pairs:
             continue
-        for pair_idx, (lhs, rhs) in enumerate(pairs):
+        for pair_idx, (lhs_raw, rhs_raw) in enumerate(pairs):
+            # First apply macro expansion so unparseable-token detection and
+            # sympy parsing see the underlying tex, not the aliases.
+            lhs, lhs_note = _expand(lhs_raw)
+            rhs, rhs_note = _expand(rhs_raw)
+            macro_note = None
+            if lhs_note or rhs_note:
+                macro_note = " | ".join(filter(None, [lhs_note, rhs_note]))
+            expanded = (lhs != lhs_raw) or (rhs != rhs_raw)
+
             hits = unparseable_hits(lhs) + unparseable_hits(rhs) + body_hits
             if hits:
-                targets.append(_skip_target(
+                tgt = _skip_target(
                     idx, pair_idx, item,
-                    reason="sympy cannot parse operator(s): " + ", ".join(sorted(set(hits))),
+                    reason=("sympy cannot parse operator(s): "
+                            + ", ".join(sorted(set(hits)))),
                     lhs_tex=lhs, rhs_tex=rhs,
-                ))
-                counts["unverifiable"] += 1
+                    unverifiable_kind="tool",
+                )
+                if macro_note:
+                    tgt["evidence"]["macro_expansion_note"] = macro_note
+                if expanded:
+                    tgt["evidence"]["macro_expanded"] = True
+                # Optional LLM fallback — only for tool-gap cases, not for
+                # legitimately-inconclusive evidence.
+                if llm_available:
+                    context = _collapse_ws(item["raw"])[:1200]
+                    jres = _llm_math_judge(lhs, rhs, context)
+                    tgt["evidence"]["llm_judge"] = jres
+                    _apply_llm_verdict(tgt, jres)
+                    tools_used["llm_fallback"] += 1
+                else:
+                    tools_used["none"] += 1
+                counts[tgt["status"]] = counts.get(tgt["status"], 0) + 1
+                targets.append(tgt)
                 continue
             try:
                 with _equation_timeout(per_equation_timeout_seconds):
@@ -484,10 +797,10 @@ def run(
             except _SympyTimeout as exc:
                 errors.append(f"eq {idx}.{pair_idx}: {exc}")
                 locator = f"eq:{idx}" if pair_idx == 0 else f"eq:{idx}.{pair_idx}"
-                targets.append({
+                tgt = {
                     "locator": locator,
                     "status": "unverifiable",
-                    "severity_suggestion": "P0",
+                    "severity_suggestion": "major",
                     "evidence": {
                         "quote": _collapse_ws(item["raw"])[:MAX_EQ_QUOTE_CHARS],
                         "lhs_tex": lhs[:MAX_EQ_QUOTE_CHARS],
@@ -498,17 +811,40 @@ def run(
                         ),
                         "judge_confidence": "medium",
                         "finding_kind": "sympy_timeout",
+                        "unverifiable_kind": "tool",
                     },
                     "root_cause_key": f"math-sympy-timeout-{idx}-{pair_idx}",
-                })
+                }
+                if macro_note:
+                    tgt["evidence"]["macro_expansion_note"] = macro_note
+                targets.append(tgt)
                 counts["unverifiable"] += 1
+                tools_used["none"] += 1
                 continue
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"eq {idx}.{pair_idx}: {exc}")
                 detail = {
                     "lhs_tex": lhs[:MAX_EQ_QUOTE_CHARS], "rhs_tex": rhs[:MAX_EQ_QUOTE_CHARS],
-                    "status": "unverifiable", "judge_notes": f"verifier exception: {exc}",
+                    "status": "unverifiable",
+                    "judge_notes": f"verifier exception: {exc}",
+                    "unverifiable_kind": "evidence",
+                    "tool_path": "sympy",
                 }
+            detail["macro_expansion_note"] = macro_note
+            detail["macro_expanded"] = expanded
+            # If sympy failed to parse and LLM is available, consult LLM judge.
+            if (detail.get("parse_failed") or detail["status"] == "unverifiable") and llm_available:
+                context = _collapse_ws(item["raw"])[:1200]
+                jres = _llm_math_judge(lhs, rhs, context)
+                detail["llm_judge"] = jres
+                # Remember sympy's original note so we can audit after LLM override.
+                _apply_llm_verdict_to_detail(detail, jres)
+                tools_used["llm_fallback"] += 1
+            else:
+                key = "sympy_with_macros" if expanded else "sympy"
+                tools_used[key] += 1
+                detail["judge_method"] = "sympy"
+
             target = build_target(idx, item, pair_idx, detail)
             targets.append(target)
             counts[target["status"]] = counts.get(target["status"], 0) + 1
@@ -545,6 +881,10 @@ def run(
         status=status, severity=severity, summary=summary, targets=targets,
         tex_len=len(tex), seeds=seeds, tolerance=tolerance,
         n_items=len(items), sympy_ok=True, errors=errors,
+        tools_used=tools_used,
+        llm_fallback_enabled=llm_available,
+        macro_expansion_enabled=use_macro_expansion and bool(macros),
+        n_macros=len(macros),
     )
     _write(out_path, report)
     return report
@@ -554,6 +894,10 @@ def _build_report(
     *, status: str, severity: str, summary: str, targets: list[dict[str, Any]],
     tex_len: int, seeds: int, tolerance: float, n_items: int, sympy_ok: bool,
     errors: list[str],
+    tools_used: dict[str, int] | None = None,
+    llm_fallback_enabled: bool = False,
+    macro_expansion_enabled: bool = False,
+    n_macros: int = 0,
 ) -> dict[str, Any]:
     return {
         "verifier_id": VERIFIER_ID, "verifier_version": VERIFIER_VERSION,
@@ -566,7 +910,11 @@ def _build_report(
                 "tex_chars": tex_len, "seeds": seeds, "tolerance": tolerance,
                 "n_equations_extracted": n_items, "n_targets": len(targets),
                 "sympy_available": sympy_ok,
+                "llm_fallback_enabled": llm_fallback_enabled,
+                "macro_expansion_enabled": macro_expansion_enabled,
+                "n_macros_extracted": n_macros,
             },
+            "verifier_tools_used": tools_used or {},
         },
         "errors": errors,
     }
@@ -602,6 +950,16 @@ def main() -> int:
         "--max-equations", type=int, default=500, dest="max_equations",
         help="Truncate verification after this many extracted equations",
     )
+    parser.add_argument(
+        "--no-macro-expansion", action="store_true", dest="no_macro_expansion",
+        help="Disable \\newcommand/\\def expansion (debug-only).",
+    )
+    parser.add_argument(
+        "--no-llm-math-fallback", action="store_true", dest="no_llm_fallback",
+        help=("Disable the LLM plausibility fallback even when "
+              "ANTHROPIC_API_KEY is set (saves ~2k tokens per unresolved "
+              "equation)."),
+    )
     args = parser.parse_args()
 
     if not args.tex.is_file():
@@ -615,6 +973,8 @@ def main() -> int:
         tolerance=args.tolerance,
         per_equation_timeout_seconds=args.equation_timeout,
         max_equations=args.max_equations,
+        use_macro_expansion=not args.no_macro_expansion,
+        use_llm_fallback=not args.no_llm_fallback,
     )
     print(f"[{VERIFIER_ID}] {report['status'].upper()}: {report['summary']}")
     for t in report["targets"][:20]:

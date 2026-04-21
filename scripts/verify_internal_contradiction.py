@@ -54,7 +54,7 @@ except ImportError:
     )
 
 VERIFIER_ID = "verify_internal_contradiction"
-VERIFIER_VERSION = "0.1"
+VERIFIER_VERSION = "0.3-stageB2"
 
 DEFAULT_MODEL_ENV = "REVIEW_VERIFIER_MODEL"
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -383,7 +383,19 @@ def run(
             "status": "unverifiable",
             "severity_suggestion": "P0",
             "summary": f"LLM required for contradiction extraction; {err}",
-            "targets": [],
+            "targets": [{
+                "locator": "pair:preflight",
+                "status": "unverifiable",
+                "severity_suggestion": "P0",
+                "evidence": {
+                    "quote": "",
+                    "judge_notes": f"LLM unavailable ({err}); cannot extract contradictions.",
+                    "judge_confidence": "medium",
+                    "finding_kind": "llm_unavailable",
+                    "unverifiable_kind": "env",
+                },
+                "root_cause_key": "internal-contradiction-llm-unavailable",
+            }],
             "metadata": {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "cost_usd": 0.0,
@@ -457,6 +469,10 @@ def run(
                     "section_b": b,
                     "triples_a_count": len(t_a),
                     "triples_b_count": len(t_b),
+                    # Empty section = either section parser failed (tool gap)
+                    # or LLM returned [] despite input (evidence). We cannot
+                    # distinguish perfectly — default to tool (human review).
+                    "unverifiable_kind": "tool",
                 },
                 "root_cause_key": f"internal-contradiction-section-empty-{a}-{b}",
             })

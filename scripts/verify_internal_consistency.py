@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 VERIFIER_ID = "verify_internal_consistency"
-VERIFIER_VERSION = "0.1"
+VERIFIER_VERSION = "0.3-stageB2"
 
 SECTION_KEYS = ["abstract", "introduction", "methods", "results", "conclusion"]
 
@@ -349,18 +349,24 @@ def build_target(
         judge_notes_lines.append(f"Leak ratio = {finding['leak_ratio']}")
 
     status = "verified" if finding["kind"] != "methods_missing" else "unverifiable"
+    evidence: dict[str, Any] = {
+        "quote": quote_a,
+        "paired_quote": quote_m,
+        "judge_notes": "\n".join(judge_notes_lines),
+        "judge_confidence": "high" if finding["kind"] == "universality_asymmetry" else "medium",
+        "finding_kind": finding["kind"],
+        "detail": finding,
+    }
+    if status == "unverifiable":
+        # Methods section unparseable is a parser-coverage gap (tool), not a
+        # paper defect, but it does leave the paper unverifiable until the
+        # human confirms the methods exist.
+        evidence["unverifiable_kind"] = "tool"
     return {
         "locator": f"pair:{pair_name}",
         "status": status,
         "severity_suggestion": severity,
-        "evidence": {
-            "quote": quote_a,
-            "paired_quote": quote_m,
-            "judge_notes": "\n".join(judge_notes_lines),
-            "judge_confidence": "high" if finding["kind"] == "universality_asymmetry" else "medium",
-            "finding_kind": finding["kind"],
-            "detail": finding,
-        },
+        "evidence": evidence,
         "root_cause_key": f"internal-consistency-{finding['kind']}",
     }
 

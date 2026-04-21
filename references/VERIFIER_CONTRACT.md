@@ -36,7 +36,8 @@ Each verifier runs over multiple targets (citations, section pairs, equations, .
     "external_url": "optional DOI/arXiv/URL proving or disproving",
     "judge_notes": "LLM judge explanation if used",
     "judge_confidence": "high|medium|low",
-    "second_opinion_agreed": true
+    "second_opinion_agreed": true,
+    "unverifiable_kind": "env | tool | evidence"
   },
   "severity_suggestion": "P0 | major | moderate | minor",
   "root_cause_key": "stable slug (e.g. 'citation-content-mismatch-smith2024')"
@@ -46,8 +47,13 @@ Each verifier runs over multiple targets (citations, section pairs, equations, .
 ## Status semantics (strict)
 
 - **verified** — external evidence decisively confirms the finding. Downstream must treat as actionable defect.
-- **unverifiable** — evidence gathering was inconclusive (API unreachable, abstract missing, ambiguous LLM judge, paper paywalled without abstract). **Downstream MUST upgrade to P0** and require human attention. Never silently pass.
-- **failed** — the claimed finding was checked and disproven (false alarm). Downstream can drop the finding.
+- **unverifiable** — evidence gathering was inconclusive. Every target with `status="unverifiable"` MUST carry `evidence.unverifiable_kind` with one of three values (legacy reports without this field default to `evidence`):
+  - **`env`** — host misconfiguration (missing API key, unreachable network, missing optional dep). The paper is NOT known to have a defect. Consumer should tag `disposition=setup_needed` and avoid `gate_blocker`. Fix the host, re-run.
+  - **`tool`** — the verifier's tool coverage gap (sympy can't parse `\mathcal{C}`, regex misses custom macro, timeout). Not a known paper defect; consumer should tag `disposition=human_review_recommended`, not `gate_blocker`. A human reviewer should look.
+  - **`evidence`** — we ran the check and the evidence was inconclusive (DOI resolved but abstract empty, LLM judge low-confidence, seeds produced NaN). Consumer tags `disposition=gate_blocker` — this is the original P0 upgrade case.
+- **failed** — the claimed finding was checked and disproven (false alarm, or a real defect depending on verifier semantics). Downstream treats `failed` as gate-blocking unless it was informational.
+
+**Historical note.** Prior to v0.3-stageB2 the contract said "downstream MUST upgrade unverifiable to P0". That is now the `unverifiable_kind=evidence` rule. The `env` and `tool` subtypes prevent the false-P0 flood that made real signal unreadable.
 
 ## Severity suggestion mapping
 

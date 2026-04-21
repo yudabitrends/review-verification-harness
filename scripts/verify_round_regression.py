@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 VERIFIER_ID = "verify_round_regression"
-VERIFIER_VERSION = "0.1"
+VERIFIER_VERSION = "0.3-stageB2"
 MAX_QUOTE_CHARS = 400
 
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
@@ -230,6 +230,10 @@ def _crash_target(locator: str, rck: str, notes: str) -> dict[str, Any]:
     return _target(
         locator=locator, status="unverifiable", severity="P0",
         quote="", judge_notes=notes, root_cause_key=rck,
+        # A crash inside a regression-checker is an env/tool condition, not a
+        # finding about the paper itself. Tag as env so downstream consumers
+        # route to setup_needed rather than gate_blocker.
+        extra={"unverifiable_kind": "env"},
     )
 
 

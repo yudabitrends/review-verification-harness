@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 VERIFIER_ID = "verify_citations_full"
-VERIFIER_VERSION = "0.1"
+VERIFIER_VERSION = "0.3-stageB2"
 USER_AGENT = f"{VERIFIER_ID}/{VERIFIER_VERSION} (mailto:yudabitrends@gmail.com)"
 CACHE_ROOT = Path.home() / ".claude" / "cache" / "review-verification-harness" / VERIFIER_ID
 CACHE_TTL_SECONDS = 30 * 24 * 3600
@@ -644,6 +644,13 @@ def classify_target(
             "Could not resolve citation to a readable abstract. "
             "Reference may be fabricated, paywalled without API access, or citation metadata is wrong."
         )
+        # Network failure (TimeoutError / URLError / 5xx) is an env condition;
+        # a clean "not found" from CrossRef/Semantic Scholar is evidence.
+        errs = " ".join(resolved.raw_errors).lower()
+        network_markers = ("timeout", "urlerror", "failed to", "connect", "network",
+                           "http 5", "http 429", "http 403")
+        kind = "env" if any(m in errs for m in network_markers) else "evidence"
+        evidence["unverifiable_kind"] = kind
         return {
             "status": "unverifiable",
             "severity_suggestion": "P0",
@@ -680,6 +687,7 @@ def classify_target(
             (evidence.get("judge_notes") or "")
             + " | Resolver author mismatch — DOI/title may point to a different paper than cited."
         )
+        evidence["unverifiable_kind"] = "evidence"
         return {
             "status": "unverifiable",
             "severity_suggestion": "P0",
@@ -688,6 +696,9 @@ def classify_target(
         }
 
     if judge.get("stub") or verdict == "insufficient_context" or not agreed:
+        # Stub means the LLM judge couldn't run (no API key / SDK) — that's env.
+        # insufficient_context / second-opinion disagreement are evidence gaps.
+        evidence["unverifiable_kind"] = "env" if judge.get("stub") else "evidence"
         return {
             "status": "unverifiable",
             "severity_suggestion": "P0",

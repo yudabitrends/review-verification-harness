@@ -8,6 +8,26 @@ The ≤5-round protocol combining `review-verification-harness` (script evidence
 
 ---
 
+## Round 0 — Preflight (Stage B2)
+
+Before R1 runs, `run_round.sh` invokes `scripts/_preflight.py` (unless `--skip-preflight`). Preflight checks:
+
+- `ANTHROPIC_API_KEY` is set
+- `anthropic` and `sympy` packages importable
+- `antlr4-python3-runtime` (sympy's LaTeX parser dep) importable
+- CrossRef and arXiv reachable from this host
+
+Exit codes:
+- `0` (ready): proceed silently
+- `1` (degraded): warning printed to stderr, pipeline proceeds. Affected verifiers will emit `unverifiable_kind=env` targets that downstream consumers route to `setup_needed`, not `gate_blocker`.
+- `2` (setup_incomplete): abort, fix the missing dep, retry.
+
+The preflight JSON is written to `workspace/r<N>/verifier/_preflight.json` so the consolidator and reporters see it alongside the content-verifier outputs. Interpret it as the first-class source for "why is this run degraded?" before reading individual unverifiable target evidence.
+
+**Run preflight standalone**: `python3 ~/.claude/skills/review-verification-harness/scripts/_preflight.py` prints a human report.
+
+---
+
 ## Workspace conventions
 
 Canonical per-round layout:
