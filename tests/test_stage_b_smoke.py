@@ -795,6 +795,262 @@ def test_math_verifier_macro_expansion_rescues_previously_unparseable() -> None:
                 f"targets={report['targets']}")
 
 
+# ------------------------- v0.4 cc-bridge tests -------------------------
+
+
+def test_math_verifier_aligned_env_not_false_failed() -> None:
+    """Regression test: `\\begin{aligned}` envelope must not produce sign-flip
+    false positives. Previously, the `aligned` wrapper text was being read by
+    sympy's parse_latex as a product of letters, generating bogus `failed`
+    targets on real physics papers."""
+    m = _fresh("math_sympy_aligned", ROOT / "verify_math_sympy.py")
+    ok_sympy, _err = m._sympy_available()
+    tex = (
+        r"\begin{equation}"
+        r"\begin{aligned}" "\n"
+        r"X &= a Y \\" "\n"
+        r"Y &= b X" "\n"
+        r"\end{aligned}"
+        r"\end{equation}"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "math.json"
+        report = m.run(
+            tex=tex, out_path=out, seeds=3, tolerance=1e-8,
+            use_llm_fallback=False,
+        )
+    # What must NOT happen: a target tagged `failed` with sign_flip_detected
+    # solely because the envelope text leaked in.
+    failed_with_flip = [
+        t for t in report["targets"]
+        if t["status"] == "failed"
+        and t.get("evidence", {}).get("sign_flip_detected")
+    ]
+    assert_true(not failed_with_flip,
+                f"aligned-env wrappers must not produce sign-flip failures; "
+                f"got {failed_with_flip}")
+    # Defense-in-depth: no target's lhs_tex should contain `\begin{` or the
+    # raw word `aligned` — those are tell-tales of envelope leakage.
+    leaked = [
+        t for t in report["targets"]
+        if (r"\begin{" in (t.get("evidence", {}).get("lhs_tex") or ""))
+        or ("aligned" in (t.get("evidence", {}).get("lhs_tex") or ""))
+    ]
+    assert_true(not leaked,
+                f"aligned envelope leaked into target lhs_tex: {leaked}")
+
+
+def test_citations_batch_emit_writes_task_jsonl() -> None:
+    """batch-emit mode: citations verifier writes JSONL tasks + state file."""
+    cc = _fresh("citations_emit", ROOT / "verify_citations_full.py")
+    jb_path = ROOT / "_judge_backend.py"
+    jb = _fresh("judge_backend_c1", jb_path)
+
+    # Patch the HTTP resolver to return a CrossRef-shaped payload.
+    saved_http = cc._http_get
+    fake_payload = json.dumps({
+        "message": {
+            "title": ["Linear Scaling Methods"],
+            "abstract": "<p>We present linear scaling on n<1000.</p>",
+            "issued": {"date-parts": [[2024]]},
+            "author": [{"family": "Smith", "given": "John"}],
+        }
+    }).encode()
+
+    def _fake_get(url, headers=None):
+        if "crossref" in url:
+            return 200, fake_payload
+        return 404, b""
+
+    cc._http_get = _fake_get
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out.json"
+            tasks_out = Path(td) / "tasks.jsonl"
+            state_file = Path(td) / "state.json"
+            backend = jb.BackendContext(
+                mode="batch-emit",
+                tasks_out=tasks_out,
+                state_file=state_file,
+                sdk_ok=False,
+            )
+            claim = {
+                "locator": "cite:smith2024",
+                "claim_quote": "Smith (2024) shows linear scaling for n<1000.",
+                "reference": {"doi": "10.1234/smith.2024",
+                              "title": "Linear Scaling Methods",
+                              "authors": ["Smith, John"], "year": 2024},
+            }
+            cc.run(out_path=out, fast=False, use_cache=False,
+                   backend=backend, claims=[claim])
+            assert_true(tasks_out.is_file(),
+                        f"tasks jsonl missing: {tasks_out}")
+            lines = [ln for ln in
+                     tasks_out.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+            assert_true(len(lines) >= 2,
+                        f"expected >=2 tasks (primary + devils_advocate), "
+                        f"got {len(lines)}")
+            for ln in lines:
+                obj = json.loads(ln)
+                for key in ("task_id", "verifier", "target_locator", "kind",
+                            "system", "user", "max_tokens", "temperature",
+                            "expected_format"):
+                    assert_true(key in obj,
+                                f"task missing key {key!r}: {list(obj)}")
+            assert_true(state_file.is_file(),
+                        "state file should be written")
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            assert_true(state.get("phase") == "batch-emit",
+                        f"phase should be batch-emit, got {state.get('phase')}")
+            assert_true(len(state.get("pending_targets") or []) >= 1,
+                        f"expected pending_targets, got "
+                        f"{state.get('pending_targets')}")
+            assert_true("resolved_refs" in state,
+                        f"resolved_refs missing from state: {list(state)}")
+    finally:
+        cc._http_get = saved_http
+
+
+def test_citations_batch_ingest_fills_pending_targets() -> None:
+    """batch-ingest: state + results JSONL collapse to final verifier JSON."""
+    cc = _fresh("citations_ingest", ROOT / "verify_citations_full.py")
+    jb = _fresh("judge_backend_c2", ROOT / "_judge_backend.py")
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        out = td_path / "out.json"
+        state_file = td_path / "state.json"
+        results_in = td_path / "results.jsonl"
+
+        state = {
+            "verifier_id": "verify_citations_full",
+            "verifier_version": "0.4-cc-bridge",
+            "phase": "batch-emit",
+            "pending_targets": [
+                {
+                    "locator": "cite:A",
+                    "status": "pending_llm",
+                    "severity_suggestion": "major",
+                    "evidence": {"quote": "Paper A claims X",
+                                 "external_url": None},
+                    "root_cause_key": "citation-pending-llm-a",
+                    "_claim_quote": "Paper A claims X",
+                    "_ref_meta": {"doi": "10.1/a", "title": "A"},
+                },
+                {
+                    "locator": "cite:B",
+                    "status": "pending_llm",
+                    "severity_suggestion": "major",
+                    "evidence": {"quote": "Paper B claims Y"},
+                    "root_cause_key": "citation-pending-llm-b",
+                    "_claim_quote": "Paper B claims Y",
+                    "_ref_meta": {"doi": "10.1/b", "title": "B"},
+                },
+                {
+                    "locator": "cite:C",
+                    "status": "pending_llm",
+                    "severity_suggestion": "major",
+                    "evidence": {"quote": "Paper C claims Z"},
+                    "root_cause_key": "citation-pending-llm-c",
+                    "_claim_quote": "Paper C claims Z",
+                    "_ref_meta": {"doi": "10.1/c", "title": "C"},
+                },
+            ],
+            "final_targets": [],
+            "resolved_refs": {
+                "cite:A": {"title": "A", "abstract": "abs A", "year": 2024,
+                           "authors": ["Smith, J."], "source": "crossref"},
+                "cite:B": {"title": "B", "abstract": "abs B", "year": 2024,
+                           "authors": ["Jones, K."], "source": "crossref"},
+                "cite:C": {"title": "C", "abstract": "abs C", "year": 2024,
+                           "authors": ["Lee, M."], "source": "crossref"},
+            },
+            "fast": False,
+            "out_path": str(out),
+            "use_cache": False,
+        }
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        def _result(tid, body):
+            return json.dumps({
+                "task_id": tid, "ok": True, "body": body,
+                "tokens_in": 100, "tokens_out": 20, "error": None,
+            })
+
+        results_lines = [
+            _result("cite:A:primary",
+                    '{"verdict":"supports","confidence":"high","reason":"ok"}'),
+            _result("cite:A:devils_advocate",
+                    '{"verdict":"supports","confidence":"medium","reason":"ok"}'),
+            _result("cite:B:primary",
+                    '{"verdict":"contradicts","confidence":"high","reason":"bad"}'),
+            _result("cite:B:devils_advocate",
+                    '{"verdict":"contradicts","confidence":"high","reason":"bad"}'),
+            _result("cite:C:primary",
+                    '{"verdict":"insufficient_context","confidence":"low","reason":"unclear"}'),
+            _result("cite:C:devils_advocate",
+                    '{"verdict":"insufficient_context","confidence":"low","reason":"unclear"}'),
+        ]
+        results_in.write_text("\n".join(results_lines) + "\n", encoding="utf-8")
+
+        backend = jb.BackendContext(
+            mode="batch-ingest", results_in=results_in,
+            state_file=state_file, sdk_ok=False,
+        )
+        report = cc.run(out_path=out, backend=backend)
+
+    statuses = {t["locator"]: t["status"] for t in report["targets"]}
+    assert_true(statuses.get("cite:A") == "verified",
+                f"A should be verified, got {statuses}")
+    assert_true(statuses.get("cite:B") == "failed",
+                f"B should be failed, got {statuses}")
+    assert_true(statuses.get("cite:C") == "unverifiable",
+                f"C should be unverifiable, got {statuses}")
+    c_kind = next(
+        (t["evidence"].get("unverifiable_kind") for t in report["targets"]
+         if t["locator"] == "cite:C"), None,
+    )
+    assert_true(c_kind == "evidence",
+                f"C's unverifiable_kind should be 'evidence', got {c_kind!r}")
+
+
+def test_cc_run_round_exits_7_when_tasks_pending() -> None:
+    """Orchestrator smoke: a paper with one unparseable integral (sympy cannot
+    decide) should cause the math verifier to emit an LLM task, and
+    cc_run_round.py should exit 7 with a manifest referencing it."""
+    import subprocess as _sub
+    tex = (
+        r"\documentclass{article}" "\n"
+        r"\begin{document}" "\n"
+        r"\begin{abstract} We study motion. \end{abstract}" "\n"
+        r"\section{Methods} We integrate." "\n"
+        r"$$ \int x\, dx = \frac{x^2}{2} $$" "\n"
+        r"\end{document}" "\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        paper = td_path / "paper.tex"
+        paper.write_text(tex, encoding="utf-8")
+        workspace = td_path / "ws"
+        cc_run = ROOT / "cc_run_round.py"
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        res = _sub.run(
+            [sys.executable, str(cc_run), str(paper),
+             "--workspace", str(workspace), "--round", "1"],
+            capture_output=True, text=True, env=env,
+        )
+    assert_true(res.returncode == 7,
+                f"expected exit 7 (pending), got {res.returncode}; "
+                f"stderr={res.stderr[:400]}; stdout={res.stdout[:400]}")
+    assert_true("total_llm_tasks" in res.stdout,
+                f"manifest missing total_llm_tasks: {res.stdout[:400]}")
+    # Parse the stdout JSON and confirm at least one task is pending.
+    manifest = json.loads(res.stdout)
+    assert_true(manifest.get("total_llm_tasks", 0) >= 1,
+                f"expected >=1 pending task, got manifest {manifest}")
+
+
 # ------------------------- main -------------------------
 
 
@@ -828,6 +1084,11 @@ def main() -> int:
         test_latex_macro_expansion_recursive,
         test_math_verifier_llm_fallback_without_key_still_unverifiable_tool,
         test_math_verifier_macro_expansion_rescues_previously_unparseable,
+        # v0.4 cc-bridge additions:
+        test_math_verifier_aligned_env_not_false_failed,
+        test_citations_batch_emit_writes_task_jsonl,
+        test_citations_batch_ingest_fills_pending_targets,
+        test_cc_run_round_exits_7_when_tasks_pending,
     ]
     failed = 0
     for t in tests:

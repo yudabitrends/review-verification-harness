@@ -54,7 +54,17 @@ except ImportError:
     )
 
 VERIFIER_ID = "verify_internal_contradiction"
-VERIFIER_VERSION = "0.3-stageB2"
+VERIFIER_VERSION = "0.4-cc-bridge"
+
+# Shared CC-bridge backend helper.
+try:
+    import _judge_backend  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import _judge_backend  # type: ignore
+    except ImportError:
+        _judge_backend = None  # type: ignore
 
 DEFAULT_MODEL_ENV = "REVIEW_VERIFIER_MODEL"
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -364,12 +374,396 @@ def _estimate_cost_usd(model: str, total_in: int, total_out: int) -> float | Non
 # ----------------------------- Orchestration -----------------------------
 
 
+def _triple_user_prompt(section_name: str, text: str) -> str:
+    trimmed = text[:MAX_SECTION_CHARS]
+    return (
+        f"Section name: {section_name}\n\n"
+        f"---\n{trimmed}\n---\n\n"
+        "Return the JSON array of claim triples now."
+    )
+
+
+def _compare_user_prompt(a: str, b: str,
+                         triples_a: list[dict[str, Any]],
+                         triples_b: list[dict[str, Any]]) -> str:
+    return (
+        f"Section A = {a}:\n{json.dumps(triples_a, ensure_ascii=False)}\n\n"
+        f"Section B = {b}:\n{json.dumps(triples_b, ensure_ascii=False)}\n\n"
+        "Emit the contradiction JSON array now (empty array if none)."
+    )
+
+
+def _emit_triples_phase(
+    sections: dict[str, str], out_path: Path, fast: bool, backend,
+) -> dict[str, Any]:
+    _judge_backend.ensure_emit_args(backend)
+    relevant_sections: set[str] = set()
+    for a, b in SECTION_PAIRS:
+        if fast and (a, b) != ("abstract", "conclusion"):
+            continue
+        relevant_sections.update({a, b})
+
+    tasks: list[dict[str, Any]] = []
+    sections_with_text: dict[str, str] = {}
+    for name in sorted(relevant_sections):
+        text = sections.get(name, "")
+        sections_with_text[name] = text
+        if not text.strip():
+            continue
+        tasks.append(_judge_backend.build_task(
+            task_id=f"triples:{name}",
+            verifier=VERIFIER_ID,
+            target_locator=f"triples:{name}",
+            kind="triple_extract",
+            system=TRIPLE_EXTRACT_SYSTEM,
+            user=_triple_user_prompt(name, text),
+            max_tokens=800, temperature=0, expected_format="json_array",
+        ))
+    _judge_backend.write_tasks(backend.tasks_out, tasks)
+
+    state = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "phase": "triples",
+        "sections": sections_with_text,
+        "fast": fast,
+        "out_path": str(out_path),
+    }
+    _judge_backend.write_state(backend.state_file, state)
+
+    report = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "status": "pending_llm",
+        "severity_suggestion": "minor",
+        "summary": f"batch-emit triples: {len(tasks)} task(s) queued",
+        "targets": [{
+            "locator": "pair:pending_llm",
+            "status": "pending_llm",
+            "severity_suggestion": "minor",
+            "evidence": {
+                "quote": "",
+                "judge_notes": (
+                    f"awaiting LLM triple extraction across "
+                    f"{len(relevant_sections)} section(s)"),
+            },
+            "root_cause_key": "internal-contradiction-pending-llm",
+        }],
+        "metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "model": _current_model(), "cached": False,
+            "judge_backend": "batch-emit",
+            "phase": "triples",
+            "n_llm_tasks_emitted": len(tasks),
+            "inputs": {
+                "sections_present": [k for k, v in sections.items() if v.strip()],
+                "fast_mode": fast,
+            },
+        },
+        "errors": [],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def _ingest_triples_and_emit_compare(
+    out_path: Path, backend,
+) -> dict[str, Any]:
+    """First-wave ingest: absorb triple-extract results, emit compare tasks.
+
+    Exits with ``status='pending_llm'`` and writes a new tasks file so the
+    orchestrator knows to dispatch a second wave.
+    """
+    _judge_backend.ensure_ingest_args(backend)
+    state = _judge_backend.read_state(backend.state_file)
+    fast = bool(state.get("fast"))
+    sections = state.get("sections") or {}
+    results = _judge_backend.load_results(backend.results_in)
+
+    triple_cache: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for name in sections:
+        r = results.get(f"triples:{name}")
+        if r is None:
+            triple_cache[name] = []
+            continue
+        body = r.get("body") or ""
+        data, err = _parse_json_array(body if isinstance(body, str) else json.dumps(body))
+        if data is None:
+            errors.append(f"triple_extract[{name}]: {err}")
+            triple_cache[name] = []
+            continue
+        triples = []
+        for item in data[:MAX_TRIPLES_PER_SECTION]:
+            if not isinstance(item, dict):
+                continue
+            triples.append({
+                "subject": str(item.get("subject", ""))[:200],
+                "predicate": str(item.get("predicate", ""))[:300],
+                "scope": str(item.get("scope", ""))[:200],
+                "quote_span": str(item.get("quote_span", ""))[:220],
+            })
+        triple_cache[name] = triples
+
+    # Now emit compare tasks.
+    compare_tasks: list[dict[str, Any]] = []
+    for a, b in SECTION_PAIRS:
+        if fast and (a, b) != ("abstract", "conclusion"):
+            continue
+        t_a = triple_cache.get(a, [])
+        t_b = triple_cache.get(b, [])
+        if not t_a or not t_b:
+            continue
+        compare_tasks.append(_judge_backend.build_task(
+            task_id=f"compare:{a}-{b}",
+            verifier=VERIFIER_ID,
+            target_locator=f"pair:{a}-{b}",
+            kind="compare",
+            system=COMPARE_SYSTEM,
+            user=_compare_user_prompt(a, b, t_a, t_b),
+            max_tokens=900, temperature=0, expected_format="json_array",
+        ))
+
+    # Decide where the next-wave task file goes. Prefer explicit
+    # `--judge-tasks-out`; fall back to appending a `.compare.jsonl` suffix
+    # next to the results file.
+    if backend.tasks_out:
+        next_tasks_path = backend.tasks_out
+    else:
+        next_tasks_path = backend.results_in.with_suffix(".compare.jsonl")
+
+    if compare_tasks:
+        _judge_backend.write_tasks(next_tasks_path, compare_tasks)
+
+    new_state = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "phase": "compare" if compare_tasks else "done",
+        "sections": sections,
+        "triples": triple_cache,
+        "fast": fast,
+        "out_path": str(out_path),
+        "errors": errors,
+        "compare_tasks_file": str(next_tasks_path) if compare_tasks else None,
+    }
+    _judge_backend.write_state(backend.state_file, new_state)
+
+    if not compare_tasks:
+        # No compare tasks => every pair had at least one empty side. Emit the
+        # current state as a final report.
+        return _finalize_from_state(out_path, new_state, {})
+
+    report = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "status": "pending_llm",
+        "severity_suggestion": "minor",
+        "summary": (
+            f"batch-ingest triples -> batch-emit compare: "
+            f"{len(compare_tasks)} task(s) queued"),
+        "targets": [{
+            "locator": "pair:pending_compare",
+            "status": "pending_llm",
+            "severity_suggestion": "minor",
+            "evidence": {
+                "quote": "",
+                "judge_notes": (
+                    f"awaiting LLM pairwise contradiction comparison "
+                    f"({len(compare_tasks)} pair(s))"),
+            },
+            "root_cause_key": "internal-contradiction-pending-compare",
+        }],
+        "metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "model": _current_model(), "cached": False,
+            "judge_backend": "batch-ingest",
+            "phase_transition": "triples->compare",
+            "n_llm_tasks_emitted": len(compare_tasks),
+            "compare_tasks_file": str(next_tasks_path),
+        },
+        "errors": errors,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def _finalize_from_state(
+    out_path: Path, state: dict[str, Any], results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    sections = state.get("sections") or {}
+    triple_cache = state.get("triples") or {}
+    fast = bool(state.get("fast"))
+
+    targets: list[dict[str, Any]] = []
+    pair_reports: list[dict[str, Any]] = []
+    p0_count = major_count = 0
+    errors: list[str] = list(state.get("errors") or [])
+
+    for a, b in SECTION_PAIRS:
+        if fast and (a, b) != ("abstract", "conclusion"):
+            continue
+        t_a = triple_cache.get(a, [])
+        t_b = triple_cache.get(b, [])
+        if not t_a or not t_b:
+            empty_side = a if not t_a else b
+            targets.append({
+                "locator": f"pair:{a}-{b}",
+                "status": "unverifiable",
+                "severity_suggestion": "P0",
+                "evidence": {
+                    "quote": _truncate(sections.get(a, ""), 280),
+                    "paired_quote": _truncate(sections.get(b, ""), 280),
+                    "judge_notes": (
+                        f"section {empty_side!r} produced no triples "
+                        "(empty or extraction failed); cannot verify contradiction"),
+                    "judge_confidence": "low",
+                    "finding_kind": "section_empty",
+                    "section_a": a, "section_b": b,
+                    "triples_a_count": len(t_a),
+                    "triples_b_count": len(t_b),
+                    "unverifiable_kind": "tool",
+                },
+                "root_cause_key": f"internal-contradiction-section-empty-{a}-{b}",
+            })
+            pair_reports.append({
+                "pair": f"{a}-{b}", "skipped": True,
+                "reason": f"missing triples (a={len(t_a)}, b={len(t_b)})",
+            })
+            continue
+        r = results.get(f"compare:{a}-{b}")
+        if r is None:
+            errors.append(f"compare[{a}-{b}]: result missing")
+            continue
+        body = r.get("body") or ""
+        data, err = _parse_json_array(
+            body if isinstance(body, str) else json.dumps(body))
+        if data is None:
+            errors.append(f"compare[{a}-{b}]: {err}")
+            continue
+        kept = []
+        for c in data:
+            if not isinstance(c, dict):
+                continue
+            kind = str(c.get("contradiction_kind", "")).strip()
+            conf = str(c.get("confidence", "")).strip().lower()
+            if kind not in VALID_KINDS:
+                continue
+            if conf not in VALID_CONFIDENCE:
+                conf = "low"
+            if conf == "low":
+                continue
+            contradiction = {
+                "claim_a": str(c.get("claim_a", ""))[:300],
+                "claim_b": str(c.get("claim_b", ""))[:300],
+                "contradiction_kind": kind,
+                "confidence": conf,
+                "reason": str(c.get("reason", ""))[:400],
+            }
+            target = build_contradiction_target(a, b, len(kept), contradiction)
+            targets.append(target)
+            kept.append(target)
+            if target["severity_suggestion"] == "P0":
+                p0_count += 1
+            elif target["severity_suggestion"] == "major":
+                major_count += 1
+        pair_reports.append({
+            "pair": f"{a}-{b}", "skipped": False,
+            "kept_after_confidence_filter": len(kept),
+        })
+
+    n_unverifiable = sum(1 for t in targets if t.get("status") == "unverifiable")
+
+    if not targets:
+        targets.append({
+            "locator": "pair:overall",
+            "status": "verified",
+            "severity_suggestion": "minor",
+            "evidence": {
+                "quote": _truncate(sections.get("abstract", ""), 280),
+                "paired_quote": _truncate(sections.get("conclusion", ""), 280),
+                "judge_notes": "no contradictions detected",
+                "judge_confidence": "medium",
+                "finding_kind": "no_contradiction",
+            },
+            "root_cause_key": "internal-contradiction-none",
+        })
+        overall_status, severity, summary = ("verified", "minor",
+            "no internal contradictions detected across section pairs")
+    elif p0_count or major_count:
+        overall_status = "failed"
+        if p0_count:
+            severity = "P0"
+            summary = (f"{p0_count} P0 + {major_count} major contradiction(s) "
+                       f"detected across {len(pair_reports)} section pair(s)")
+        else:
+            severity = "major"
+            summary = (f"{major_count} major contradiction(s) detected "
+                       f"across {len(pair_reports)} section pair(s)")
+    elif n_unverifiable:
+        overall_status, severity = "unverifiable", "P0"
+        summary = (
+            f"{n_unverifiable} section pair(s) could not be verified "
+            "(empty or unparseable sections)")
+    else:
+        overall_status, severity = "verified", "minor"
+        summary = "no internal contradictions detected across section pairs"
+
+    report = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "status": overall_status,
+        "severity_suggestion": severity,
+        "summary": summary,
+        "targets": targets,
+        "metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "model": _current_model(), "cached": False,
+            "judge_backend": "batch-ingest",
+            "phase": "final",
+            "inputs": {
+                "sections_present": [k for k, v in sections.items() if v.strip()],
+                "fast_mode": fast,
+                "pair_reports": pair_reports,
+                "triples_per_section": {k: len(v) for k, v in triple_cache.items()},
+            },
+        },
+        "errors": errors,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def _ingest_phase(out_path: Path, backend) -> dict[str, Any]:
+    state = _judge_backend.read_state(backend.state_file)
+    phase = state.get("phase", "triples")
+    results = _judge_backend.load_results(backend.results_in)
+    if phase == "triples":
+        return _ingest_triples_and_emit_compare(out_path, backend)
+    # phase == "compare" or "done"
+    return _finalize_from_state(out_path, state, results)
+
+
 def run(
     *,
-    sections: dict[str, str],
+    sections: dict[str, str] | None = None,
     out_path: Path,
     fast: bool = False,
+    backend=None,
 ) -> dict[str, Any]:
+    # CC-bridge paths first — they do not require sections for ingest.
+    if backend is not None and backend.mode == "batch-ingest":
+        return _ingest_phase(out_path, backend)
+    if sections is None:
+        raise ValueError("sections required for sdk / batch-emit modes")
+    if backend is not None and backend.mode == "batch-emit":
+        return _emit_triples_phase(sections, out_path, fast, backend)
+
     ready, err = _llm_ready()
     total_in = 0
     total_out = 0
@@ -610,7 +1004,17 @@ def main() -> int:
         "--fast", action="store_true",
         help="Only run the abstract↔conclusion pair (skip abstract↔methods and intro↔results)",
     )
+    if _judge_backend is not None:
+        _judge_backend.add_backend_args(parser)
     args = parser.parse_args()
+
+    backend = _judge_backend.build_context(args) if _judge_backend is not None else None
+
+    if backend is not None and backend.mode == "batch-ingest":
+        report = run(out_path=args.out, fast=args.fast, backend=backend)
+        print(f"[{VERIFIER_ID}] {report['status'].upper()}: {report['summary']}")
+        return 7 if report["status"] == "pending_llm" else (
+            0 if report["status"] == "verified" else 1)
 
     if not args.tex and not args.sections:
         print("error: must provide --tex or --sections", file=sys.stderr)
@@ -626,7 +1030,7 @@ def main() -> int:
         tex = args.tex.read_text(encoding="utf-8", errors="replace")
         sections = parse_latex(tex)
 
-    report = run(sections=sections, out_path=args.out, fast=args.fast)
+    report = run(sections=sections, out_path=args.out, fast=args.fast, backend=backend)
     print(f"[{VERIFIER_ID}] {report['status'].upper()}: {report['summary']}")
     for t in report["targets"]:
         print(f"  - {t['locator']}: {t['status']} (suggested={t['severity_suggestion']})")

@@ -3,7 +3,7 @@ name: review-verification-harness
 description: Script-backed verification primitives for academic paper review. Converts "LLM-thinks-it's-right" review comments into evidence-grounded verdicts by resolving DOIs, fetching abstracts, running sympy on equations, cross-section contradiction detection, and round-over-round regression checking. Invoked by `paper-audit`, `convergent-peer-review`, and `academic-pipeline` to back up CRITICAL findings with machine-verifiable evidence. Pairs with `ai-validation-blindspots` (R4 adversarial probes) to form the ≤5-round submission gate.
 type: verification-harness
 argument-hint: "[<paper.tex>] [--bib <paper.bib>] [--workspace <dir>] [--fast]"
-version: 0.3-stageB2
+version: 0.4-cc-bridge
 ---
 
 # review-verification-harness
@@ -59,6 +59,28 @@ bash ~/.claude/skills/review-verification-harness/scripts/run_round.sh \
 ```
 
 `bash run_round.sh --help` prints full usage. Individual scripts below remain available for custom workflows.
+
+## Using Claude Max (no API key)
+
+v0.4-cc-bridge adds an orchestrator that runs the pipeline inside a Claude Code session without `ANTHROPIC_API_KEY`. LLM judgments are deferred to subagents dispatched by the session itself (Claude Max subscription).
+
+Two-step flow:
+
+```bash
+# 1) Emit phase — runs preflight + extract_claims + scope + all 3 LLM verifiers
+#    in `--judge-backend batch-emit` mode. Exits 7 if any LLM tasks pending.
+python3 ~/.claude/skills/review-verification-harness/scripts/cc_run_round.py \
+    paper.tex --bib paper.bib --workspace workspace --round 1 [--fast]
+
+# 2) A Claude Code session reads scripts/cc_dispatch_template.md and dispatches
+#    subagents (≤10 tasks per batch) to produce
+#    workspace/r1/judge_results/<verifier>.results.jsonl.
+
+# 3) Finalize phase — ingests results, writes final verifier JSONs.
+python3 scripts/cc_run_round.py --phase finalize --workspace workspace --round 1
+```
+
+If `finalize` exits 7, a second wave was emitted (typical for `verify_internal_contradiction`'s compare step). Dispatch the new task file the same way and re-invoke `finalize` once more.
 
 ```bash
 # Preprocess: extract claims from paper (no LLM needed)
@@ -150,7 +172,7 @@ Stage B2 clarifies: `unverifiable ≠ pass` still holds, but the three-state tax
 
 Known conditions under which verifier outputs are noisy, degraded, or misleading. These are expected behaviors, not bugs — but they require human interpretation rather than blind trust:
 
-- **Missing `ANTHROPIC_API_KEY`** — `verify_citations_full` and `verify_internal_contradiction` emit `unverifiable` P0 at the top level. Interpret as "needs human review", not as an actual paper defect. The gate-blocker is the absence of verification, not a found issue.
+- **Missing `ANTHROPIC_API_KEY`** — two paths: (a) Outside Claude Code, `verify_citations_full` and `verify_internal_contradiction` emit `unverifiable` P0 at the top level. Interpret as "needs human review", not as an actual paper defect. (b) Inside Claude Code Max, use the CC-bridge flow: `scripts/cc_run_round.py` defers LLM work to dispatched subagents via `--judge-backend batch-emit` / `batch-ingest`. Results are equivalent to the API-key path; only the dispatcher changes.
 - **Missing `--bib`** — `extract_claims` will still emit citation records but with empty reference metadata; `verify_citations_full` then emits `unverifiable` P0 for every citation (no DOI/author/year to resolve against). Supply a `.bib` file or expect uniformly noisy citation output that is not actionable.
 - **sympy not installed** — `verify_math_sympy` emits top-level `unverifiable` P0 gracefully (does not crash). Install with `pip install sympy antlr4-python3-runtime` to enable real symbolic/numerical equation checking; otherwise treat math targets as human-review-required.
 - **Large citation count (>100)** — citation verifier spends ~2× the typical per-paper LLM cost (two-pass judge, ~1 call per citation × ~2 judges). Use `--fast` to halve LLM calls by skipping the second-opinion pass. Accept a small hit in precision for a ~50% cost reduction.

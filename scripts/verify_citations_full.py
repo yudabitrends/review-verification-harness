@@ -49,7 +49,20 @@ from pathlib import Path
 from typing import Any
 
 VERIFIER_ID = "verify_citations_full"
-VERIFIER_VERSION = "0.3-stageB2"
+VERIFIER_VERSION = "0.4-cc-bridge"
+
+# Shared CC-bridge judge-backend helper. Imported defensively so older
+# invocations that load this module via importlib from arbitrary cwds still
+# work — `_judge_backend` lives beside this file.
+try:
+    import _judge_backend  # type: ignore
+except ImportError:  # pragma: no cover — defensive fallback for test loaders
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import _judge_backend  # type: ignore
+    except ImportError:
+        _judge_backend = None  # type: ignore
+
 USER_AGENT = f"{VERIFIER_ID}/{VERIFIER_VERSION} (mailto:yudabitrends@gmail.com)"
 CACHE_ROOT = Path.home() / ".claude" / "cache" / "review-verification-harness" / VERIFIER_ID
 CACHE_TTL_SECONDS = 30 * 24 * 3600
@@ -810,13 +823,407 @@ def _estimate_cost_usd(
     return round((total_in / 1e6) * in_rate + (total_out / 1e6) * out_rate, 4)
 
 
-def run(
-    claims_path: Path,
+def _judge_prompt(claim_quote: str, ref_title: str | None, ref_abstract: str) -> str:
+    """Rebuild the exact user prompt the SDK path uses for the primary judge."""
+    return (
+        f"Claim made in paper under review:\n---\n{claim_quote}\n---\n\n"
+        f"Abstract of cited reference (title: {ref_title or 'N/A'}):\n---\n{ref_abstract}\n---"
+    )
+
+
+def _adversarial_prompt(claim_quote: str, ref_title: str | None, ref_abstract: str) -> str:
+    return (
+        f"Cited paper's abstract (title: {ref_title or 'N/A'}):\n---\n{ref_abstract}\n---\n\n"
+        f"Quote from paper-under-review that attributes a claim to this citation:\n---\n{claim_quote}\n---\n\n"
+        "Attack the attribution. Where might the attributed claim go beyond what the abstract actually says? "
+        "Is the regime, the quantifier, the direction, or the object of the claim subtly different? "
+        "Emit the JSON verdict."
+    )
+
+
+def _resolved_to_dict(r: ResolvedRef) -> dict[str, Any]:
+    return {
+        "title": r.title,
+        "abstract": r.abstract,
+        "year": r.year,
+        "authors": list(r.authors),
+        "venue": r.venue,
+        "external_url": r.external_url,
+        "source": r.source,
+        "raw_errors": list(r.raw_errors),
+    }
+
+
+def _dict_to_resolved(d: dict[str, Any]) -> ResolvedRef:
+    return ResolvedRef(
+        title=d.get("title"),
+        abstract=d.get("abstract"),
+        year=d.get("year"),
+        authors=list(d.get("authors") or []),
+        venue=d.get("venue"),
+        external_url=d.get("external_url"),
+        source=d.get("source"),
+        raw_errors=list(d.get("raw_errors") or []),
+    )
+
+
+def _classify_with_prebuilt_judge(
+    claim_quote: str,
+    ref_meta: dict[str, Any],
+    resolved: ResolvedRef,
+    judge: dict[str, Any],
+    fast: bool,
+) -> dict[str, Any]:
+    """Same shape as `classify_target` but consumes a judge dict the caller
+    assembled from batch-ingest results instead of calling the SDK."""
+    evidence: dict[str, Any] = {
+        "quote": claim_quote,
+        "external_url": resolved.external_url,
+        "resolver_source": resolved.source,
+        "resolver_errors": resolved.raw_errors,
+        "resolved_title": resolved.title,
+        "resolved_year": resolved.year,
+        "judge_verdict": judge.get("verdict"),
+        "judge_confidence": judge.get("confidence"),
+        "judge_notes": judge.get("reason"),
+        "judge_model": judge.get("model"),
+        "judge_stub": judge.get("stub", False),
+        "second_opinion_agreed": judge.get("second_opinion_agreed"),
+        "second_opinion_verdict": judge.get("second_opinion_verdict"),
+        "second_opinion_reason": judge.get("second_opinion_reason"),
+        "judge_input_tokens": judge.get("input_tokens", 0),
+        "judge_output_tokens": judge.get("output_tokens", 0),
+        "judge_method": "cc_bridge",
+    }
+    author_mismatch = bool(resolved.source and "AUTHOR_MISMATCH" in resolved.source)
+    verdict = judge.get("verdict")
+    agreed = judge.get("second_opinion_agreed", True) if not fast else True
+
+    if author_mismatch:
+        evidence["judge_notes"] = (
+            (evidence.get("judge_notes") or "")
+            + " | Resolver author mismatch — DOI/title may point to a different paper than cited."
+        )
+        evidence["unverifiable_kind"] = "evidence"
+        return {
+            "status": "unverifiable",
+            "severity_suggestion": "P0",
+            "evidence": evidence,
+            "root_cause_key": _root_cause_key(ref_meta, "author-mismatch"),
+        }
+    if judge.get("stub") or verdict == "insufficient_context" or not agreed:
+        evidence["unverifiable_kind"] = "env" if judge.get("stub") else "evidence"
+        return {
+            "status": "unverifiable",
+            "severity_suggestion": "P0",
+            "evidence": evidence,
+            "root_cause_key": _root_cause_key(ref_meta, "judge-unresolved"),
+        }
+    if verdict == "supports":
+        return {
+            "status": "verified",
+            "severity_suggestion": "minor",
+            "evidence": evidence,
+            "root_cause_key": _root_cause_key(ref_meta, "match"),
+        }
+    if verdict == "contradicts":
+        return {
+            "status": "failed",
+            "severity_suggestion": "P0",
+            "evidence": evidence,
+            "root_cause_key": _root_cause_key(ref_meta, "contradicts"),
+        }
+    # not_addressed or unknown
+    return {
+        "status": "failed",
+        "severity_suggestion": "P0",
+        "evidence": evidence,
+        "root_cause_key": _root_cause_key(ref_meta, "not-addressed"),
+    }
+
+
+def _run_batch_emit(
+    claims: list[dict[str, Any]],
     out_path: Path,
+    fast: bool,
+    use_cache: bool,
+    backend,
+) -> dict[str, Any]:
+    """Resolve references deterministically, write LLM tasks + state, exit.
+
+    Produces an interim JSON report whose pending targets carry
+    ``status="pending_llm"``. The orchestrator (`cc_run_round.py`) dispatches
+    subagents through the task file and then invokes `--judge-backend
+    batch-ingest` to finalize.
+    """
+    _judge_backend.ensure_emit_args(backend)
+    pending_targets: list[dict[str, Any]] = []
+    final_targets: list[dict[str, Any]] = []
+    resolved_refs: dict[str, dict[str, Any]] = {}
+    tasks: list[dict[str, Any]] = []
+    for claim in claims:
+        ref_meta = claim.get("reference", {})
+        locator = claim["locator"]
+        try:
+            resolved = resolve_reference(ref_meta, use_cache=use_cache)
+        except Exception as exc:  # noqa: BLE001
+            final_targets.append({
+                "locator": locator,
+                "status": "unverifiable",
+                "severity_suggestion": "P0",
+                "evidence": {
+                    "quote": claim["claim_quote"],
+                    "judge_notes": f"resolver crashed: {exc}",
+                    "unverifiable_kind": "env",
+                },
+                "root_cause_key": _root_cause_key(ref_meta, "resolver-crash"),
+            })
+            continue
+        if not resolved.sufficient():
+            # Already a final target — no LLM needed.
+            evidence: dict[str, Any] = {
+                "quote": claim["claim_quote"],
+                "external_url": resolved.external_url,
+                "resolver_source": resolved.source,
+                "resolver_errors": resolved.raw_errors,
+                "resolved_title": resolved.title,
+                "resolved_year": resolved.year,
+                "judge_notes": (
+                    "Could not resolve citation to a readable abstract."),
+            }
+            errs = " ".join(resolved.raw_errors).lower()
+            network_markers = ("timeout", "urlerror", "failed to", "connect",
+                               "network", "http 5", "http 429", "http 403")
+            evidence["unverifiable_kind"] = (
+                "env" if any(m in errs for m in network_markers) else "evidence"
+            )
+            final_targets.append({
+                "locator": locator,
+                "status": "unverifiable",
+                "severity_suggestion": "P0",
+                "evidence": evidence,
+                "root_cause_key": _root_cause_key(ref_meta, "unresolvable"),
+            })
+            continue
+        resolved_refs[locator] = _resolved_to_dict(resolved)
+        pending_targets.append({
+            "locator": locator,
+            "status": "pending_llm",
+            "severity_suggestion": "major",
+            "evidence": {
+                "quote": claim["claim_quote"],
+                "external_url": resolved.external_url,
+                "resolver_source": resolved.source,
+                "resolver_errors": resolved.raw_errors,
+                "resolved_title": resolved.title,
+                "resolved_year": resolved.year,
+                "judge_notes": "awaiting LLM judgment via CC-bridge dispatch",
+            },
+            "root_cause_key": _root_cause_key(ref_meta, "pending-llm"),
+            "_claim_quote": claim["claim_quote"],
+            "_ref_meta": ref_meta,
+        })
+        # Primary judge task
+        tasks.append(_judge_backend.build_task(
+            task_id=f"{locator}:primary",
+            verifier=VERIFIER_ID,
+            target_locator=locator,
+            kind="primary_judge",
+            system=JUDGE_SYSTEM,
+            user=_judge_prompt(
+                claim["claim_quote"], resolved.title, resolved.abstract or ""),
+            max_tokens=400, temperature=0, expected_format="json",
+        ))
+        if not fast:
+            tasks.append(_judge_backend.build_task(
+                task_id=f"{locator}:devils_advocate",
+                verifier=VERIFIER_ID,
+                target_locator=locator,
+                kind="devils_advocate",
+                system=ADVERSARIAL_JUDGE_SYSTEM,
+                user=_adversarial_prompt(
+                    claim["claim_quote"], resolved.title, resolved.abstract or ""),
+                max_tokens=400, temperature=0, expected_format="json",
+            ))
+    _judge_backend.write_tasks(backend.tasks_out, tasks)
+
+    state = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "phase": "batch-emit",
+        "pending_targets": pending_targets,
+        "final_targets": final_targets,
+        "resolved_refs": resolved_refs,
+        "fast": fast,
+        "out_path": str(out_path),
+        "use_cache": use_cache,
+    }
+    _judge_backend.write_state(backend.state_file, state)
+
+    # Interim report (all current-status targets written out for inspection).
+    interim_targets = [
+        {k: v for k, v in t.items() if not k.startswith("_")}
+        for t in pending_targets
+    ] + final_targets
+    interim_status = "pending_llm" if pending_targets else (
+        "unverifiable" if final_targets else "verified")
+    severity = "minor" if interim_status in {"pending_llm", "verified"} else "P0"
+    summary = (
+        f"batch-emit: {len(tasks)} task(s) queued across "
+        f"{len(pending_targets)} pending target(s); "
+        f"{len(final_targets)} already-final target(s)"
+    )
+    report = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "status": interim_status,
+        "severity_suggestion": severity,
+        "summary": summary,
+        "targets": interim_targets,
+        "metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": 0.0,
+            "tokens_in": 0, "tokens_out": 0,
+            "model": os.environ.get("REVIEW_VERIFIER_MODEL", "claude-sonnet-4-6"),
+            "cached": use_cache,
+            "judge_backend": "batch-emit",
+            "n_llm_tasks_emitted": len(tasks),
+            "inputs": {"n_targets": len(interim_targets), "fast_mode": fast},
+        },
+        "errors": [],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def _run_batch_ingest(
+    out_path: Path, backend,
+) -> dict[str, Any]:
+    """Read state + results and produce the final verifier report."""
+    _judge_backend.ensure_ingest_args(backend)
+    state = _judge_backend.read_state(backend.state_file)
+    results = _judge_backend.load_results(backend.results_in)
+    fast = bool(state.get("fast"))
+    use_cache = bool(state.get("use_cache", True))
+    final_targets: list[dict[str, Any]] = list(state.get("final_targets") or [])
+    pending = state.get("pending_targets") or []
+    resolved_refs = state.get("resolved_refs") or {}
+    errors: list[str] = []
+
+    for ptarget in pending:
+        locator = ptarget["locator"]
+        claim_quote = ptarget.get("_claim_quote") or ptarget["evidence"].get("quote", "")
+        ref_meta = ptarget.get("_ref_meta", {}) or {}
+        resolved = _dict_to_resolved(resolved_refs.get(locator, {}))
+
+        primary_res = results.get(f"{locator}:primary")
+        if primary_res is None:
+            final_targets.append({
+                "locator": locator,
+                "status": "unverifiable",
+                "severity_suggestion": "P0",
+                "evidence": {
+                    "quote": claim_quote,
+                    "judge_notes": "primary-judge result missing in ingest",
+                    "unverifiable_kind": "env",
+                },
+                "root_cause_key": _root_cause_key(ref_meta, "judge-missing"),
+            })
+            errors.append(f"{locator}: primary result missing")
+            continue
+        judge = _judge_backend.parse_json_body(primary_res)
+        # Normalize verdict
+        if judge.get("verdict") not in {"supports", "contradicts",
+                                        "not_addressed", "insufficient_context"}:
+            judge["raw_verdict"] = judge.get("verdict")
+            judge["verdict"] = "insufficient_context"
+        if judge.get("confidence") not in {"high", "medium", "low"}:
+            judge["confidence"] = "low"
+        judge.setdefault("stub", False)
+        judge.setdefault("model", primary_res.get("model"))
+        judge["input_tokens"] = int(primary_res.get("tokens_in") or 0)
+        judge["output_tokens"] = int(primary_res.get("tokens_out") or 0)
+
+        if not fast:
+            second = results.get(f"{locator}:devils_advocate")
+            if second is None:
+                judge["second_opinion_verdict"] = None
+                judge["second_opinion_agreed"] = False
+                judge["second_opinion_reason"] = "devils-advocate result missing"
+            else:
+                parsed2 = _judge_backend.parse_json_body(second)
+                if parsed2.get("verdict") not in {"supports", "contradicts",
+                                                  "not_addressed",
+                                                  "insufficient_context"}:
+                    parsed2["verdict"] = "insufficient_context"
+                if parsed2.get("confidence") not in {"high", "medium", "low"}:
+                    parsed2["confidence"] = "low"
+                judge["second_opinion_verdict"] = parsed2.get("verdict")
+                judge["second_opinion_confidence"] = parsed2.get("confidence")
+                judge["second_opinion_reason"] = parsed2.get("reason")
+                both_supports = (judge.get("verdict") == "supports"
+                                 and parsed2.get("verdict") == "supports")
+                both_non_low = (judge.get("confidence") in {"high", "medium"}
+                                and parsed2.get("confidence") in {"high", "medium"})
+                judge["second_opinion_agreed"] = (
+                    judge.get("verdict") == parsed2.get("verdict")
+                    and (not both_supports or both_non_low)
+                )
+                judge["input_tokens"] += int(second.get("tokens_in") or 0)
+                judge["output_tokens"] += int(second.get("tokens_out") or 0)
+
+        result = _classify_with_prebuilt_judge(
+            claim_quote=claim_quote, ref_meta=ref_meta,
+            resolved=resolved, judge=judge, fast=fast,
+        )
+        result["locator"] = locator
+        final_targets.append(result)
+
+    status, severity, summary = aggregate_status(final_targets)
+    report = {
+        "verifier_id": VERIFIER_ID,
+        "verifier_version": VERIFIER_VERSION,
+        "status": status,
+        "severity_suggestion": severity,
+        "summary": summary,
+        "targets": final_targets,
+        "metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": 0.0,
+            "tokens_in": 0, "tokens_out": 0,
+            "model": os.environ.get("REVIEW_VERIFIER_MODEL", "claude-sonnet-4-6"),
+            "cached": use_cache,
+            "judge_backend": "batch-ingest",
+            "inputs": {"n_targets": len(final_targets), "fast_mode": fast},
+        },
+        "errors": errors,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report
+
+
+def run(
+    claims_path: Path | None = None,
+    out_path: Path | None = None,
     fast: bool = False,
     use_cache: bool = True,
+    *,
+    backend=None,
+    claims: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    claims = load_claims(claims_path)
+    if backend is not None and backend.mode == "batch-ingest":
+        return _run_batch_ingest(out_path, backend)
+
+    if claims is None:
+        if claims_path is None:
+            raise ValueError("either claims_path or claims list must be provided")
+        claims = load_claims(claims_path)
+
+    if backend is not None and backend.mode == "batch-emit":
+        return _run_batch_emit(claims, out_path, fast, use_cache, backend)
+
     targets: list[dict[str, Any]] = []
     total_in = 0
     total_out = 0
@@ -900,14 +1307,28 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify that cited references support the claims they are attached to.")
-    parser.add_argument("--claims", required=True, type=Path, help="JSONL with {locator, claim_quote, reference}")
+    parser.add_argument("--claims", type=Path,
+                        help="JSONL with {locator, claim_quote, reference}. "
+                             "Required for sdk / batch-emit modes.")
     parser.add_argument("--out", required=True, type=Path, help="Output JSON path (VERIFIER_CONTRACT schema)")
     parser.add_argument("--fast", action="store_true", help="Skip second-opinion judge call")
     parser.add_argument("--no-cache", action="store_true", help="Disable on-disk cache")
+    if _judge_backend is not None:
+        _judge_backend.add_backend_args(parser)
     args = parser.parse_args()
 
+    backend = _judge_backend.build_context(args) if _judge_backend is not None else None
+
     try:
-        report = run(args.claims, args.out, fast=args.fast, use_cache=not args.no_cache)
+        if backend is not None and backend.mode == "batch-ingest":
+            report = run(out_path=args.out, backend=backend)
+        else:
+            if not args.claims:
+                print("error: --claims is required for sdk / batch-emit modes",
+                      file=sys.stderr)
+                return 2
+            report = run(args.claims, args.out, fast=args.fast,
+                         use_cache=not args.no_cache, backend=backend)
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

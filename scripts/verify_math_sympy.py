@@ -73,7 +73,33 @@ except ImportError:  # running from a different cwd
         safe_expand = None  # type: ignore
 
 VERIFIER_ID = "verify_math_sympy"
-VERIFIER_VERSION = "0.3-stageB2"
+VERIFIER_VERSION = "0.4-cc-bridge"
+
+# Alignment wrapper environments. When an outer display env (equation,
+# equation*, \[..\], $$..$$) contains one of these as its body, the raw body
+# text includes the literal `\begin{aligned}...\end{aligned}` envelope. Sympy's
+# parse_latex cannot handle the envelope — it interprets `aligned` as a product
+# of letters `a*l*i*g*n*e*d`, leading to false `failed` / sign-flip verdicts.
+# We strip each wrapper and (if it contained `\\` row separators) split it
+# into one row per line, mirroring how `align` is already handled.
+_ALIGNMENT_WRAPPERS = (
+    "aligned",
+    "gathered",
+    "cases",
+    "split",
+    "multlined",
+    "alignedat",
+)
+
+# Shared CC-bridge backend helper (optional).
+try:
+    import _judge_backend  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import _judge_backend  # type: ignore
+    except ImportError:
+        _judge_backend = None  # type: ignore
 
 
 class _SympyTimeout(Exception):
@@ -267,14 +293,81 @@ def _strip_comments(tex: str) -> str:
     return re.sub(r"(?<!\\)%[^\n]*", "", tex)
 
 
+def _strip_alignment_wrappers(body: str, max_iterations: int = 3) -> list[tuple[str, int]]:
+    r"""Strip known alignment wrappers (aligned/gathered/cases/split/multlined/
+    alignedat) from an equation body, returning a list of
+    ``(row_body, row_index)``.
+
+    If the body contains no wrapper, returns ``[(body, 0)]``. If a wrapper
+    contains `\\` row separators, its body is split on those and each row is
+    emitted as its own item with increasing ``row_index``. Nested wrappers
+    (e.g. ``\begin{aligned}\begin{cases}...\end{cases}\end{aligned}``) are
+    handled by iterating the strip pass up to ``max_iterations`` times.
+    """
+    wrappers = [re.escape(w) for w in _ALIGNMENT_WRAPPERS]
+    # Match the outermost wrapper first; the `.*?` with DOTALL is non-greedy.
+    pattern = re.compile(
+        r"\\begin\{(" + "|".join(wrappers) + r")\}(?:\[[^\]]*\])?"
+        r"(.*?)"
+        r"\\end\{\1\}",
+        flags=re.DOTALL,
+    )
+
+    current = body
+    iterations = 0
+    while iterations < max_iterations:
+        m = pattern.search(current)
+        if not m:
+            break
+        inner = m.group(2)
+        before = current[:m.start()]
+        after = current[m.end():]
+        # Re-assemble so that rows from the inner wrapper carry whatever
+        # surrounding text was outside the wrapper. We simply concatenate;
+        # downstream `split_equalities` strips `&` markers.
+        current = before + inner + after
+        iterations += 1
+
+    # Whether or not we stripped anything, split the resulting body on `\\`
+    # row separators. A single-row body (no `\\`) becomes a list of length 1.
+    rows = _split_on_latex_newline(current)
+    out: list[tuple[str, int]] = []
+    for i, row in enumerate(rows):
+        stripped = row.strip()
+        if not stripped:
+            continue
+        # Defensive: strip leading/trailing `&` alignment markers so nothing
+        # like `&= a Y` reaches sympy with a leading operator.
+        stripped = re.sub(r"^\s*&\s*", "", stripped)
+        stripped = re.sub(r"\s*&\s*$", "", stripped)
+        out.append((stripped, i))
+    if not out:
+        # Everything collapsed to whitespace; hand back the original body so
+        # the caller still emits a single item which split_equalities will
+        # reject (no `=`) → no target, which is safe.
+        out = [(body, 0)]
+    return out
+
+
 def extract_equations(tex: str) -> list[dict[str, Any]]:
     """Return ordered list of displayed-equation items with `body`, `raw`, `start`."""
     tex = _strip_comments(tex)
     items: list[dict[str, Any]] = []
+
+    def _emit_with_wrappers(raw: str, body: str, start: int, base_line: int = 0) -> None:
+        """Push one or more items after stripping alignment wrappers from body."""
+        for inner_body, row_offset in _strip_alignment_wrappers(body):
+            items.append({
+                "raw": raw,
+                "body": inner_body,
+                "start": start,
+                "line_index": base_line + row_offset,
+            })
+
     for m in _DOLLAR_DISPLAY.finditer(tex):
-        items.append({"raw": m.group(0), "body": m.group(1), "start": m.start(), "line_index": 0})
+        _emit_with_wrappers(m.group(0), m.group(1), m.start())
     for m in _BRACKET_DISPLAY.finditer(tex):
-        items.append({"raw": m.group(0), "body": m.group(1), "start": m.start(), "line_index": 0})
+        _emit_with_wrappers(m.group(0), m.group(1), m.start())
     for env, split_lines in _DISPLAY_ENVS:
         start_re = re.compile(r"\\begin\{" + re.escape(env) + r"\}")
         end_re = re.compile(r"\\end\{" + re.escape(env) + r"\}")
@@ -291,9 +384,9 @@ def extract_equations(tex: str) -> list[dict[str, Any]]:
             if split_lines:
                 for i, line in enumerate(_split_on_latex_newline(body)):
                     if line.strip():
-                        items.append({"raw": raw, "body": line, "start": s.start(), "line_index": i})
+                        _emit_with_wrappers(raw, line, s.start(), base_line=i)
             else:
-                items.append({"raw": raw, "body": body, "start": s.start(), "line_index": 0})
+                _emit_with_wrappers(raw, body, s.start())
             pos = e.end()
     items.sort(key=lambda d: (d["start"], d["line_index"]))
     return items
@@ -654,17 +747,115 @@ def _skip_target(
 # ----------------------------- Orchestration -----------------------------
 
 
+def _math_llm_user_prompt(lhs: str, rhs: str, context: str) -> str:
+    return (
+        f"Surrounding paper context (trimmed):\n---\n{context[:1200]}\n---\n\n"
+        f"Equation LHS (LaTeX): {lhs[:300]}\n"
+        f"Equation RHS (LaTeX): {rhs[:300]}\n\n"
+        "Return the JSON verdict now."
+    )
+
+
+def _ingest_math_results(state: dict[str, Any], out_path: Path, backend) -> dict[str, Any]:
+    """Consume batch LLM results, apply verdicts to the pending targets, finalize."""
+    results = _judge_backend.load_results(backend.results_in)
+    targets: list[dict[str, Any]] = list(state.get("final_targets") or [])
+    pending = state.get("pending_targets") or []
+    errors: list[str] = list(state.get("errors") or [])
+
+    counts = {"verified": 0, "failed": 0, "unverifiable": 0}
+    for t in targets:
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+
+    for ptarget in pending:
+        task_id = ptarget.get("_task_id")
+        res = results.get(task_id) if task_id else None
+        if res is None:
+            ptarget["status"] = "unverifiable"
+            ptarget["severity_suggestion"] = "major"
+            ev = ptarget.setdefault("evidence", {})
+            ev["unverifiable_kind"] = "env"
+            ev["judge_notes"] = (
+                (ev.get("judge_notes") or "")
+                + " | LLM fallback result missing at ingest")
+        else:
+            body = res.get("body") or ""
+            parsed = _judge_backend.parse_json_body(res)
+            verdict = parsed.get("verdict")
+            if verdict not in {"plausible", "implausible", "uncertain"}:
+                verdict = "uncertain"
+            conf = parsed.get("confidence")
+            if conf not in {"high", "medium", "low"}:
+                conf = "low"
+            judge = {
+                "verdict": verdict, "confidence": conf,
+                "reason": str(parsed.get("reason", ""))[:400] or "no reason returned",
+                "model": res.get("model"),
+                "input_tokens": int(res.get("tokens_in") or 0),
+                "output_tokens": int(res.get("tokens_out") or 0),
+                "stub": False,
+            }
+            ev = ptarget.setdefault("evidence", {})
+            ev["llm_judge"] = judge
+            _apply_llm_verdict(ptarget, judge)
+        # Strip private fields
+        clean = {k: v for k, v in ptarget.items() if not k.startswith("_")}
+        targets.append(clean)
+        counts[clean["status"]] = counts.get(clean["status"], 0) + 1
+
+    if counts.get("failed"):
+        status, severity = "failed", "P0"
+        summary = (f"{counts['failed']} of {len(targets)} equation pair(s) failed; "
+                   f"{counts['unverifiable']} unverifiable; {counts['verified']} verified")
+    elif counts.get("unverifiable"):
+        status, severity = "unverifiable", "P0"
+        summary = (f"{counts['unverifiable']} of {len(targets)} equation pair(s) "
+                   f"unverifiable; {counts['verified']} verified")
+    else:
+        status, severity = "verified", "minor"
+        summary = f"all {counts.get('verified', 0)} equation pair(s) verified"
+
+    report = _build_report(
+        status=status, severity=severity, summary=summary, targets=targets,
+        tex_len=int(state.get("tex_len", 0)),
+        seeds=int(state.get("seeds", 3)),
+        tolerance=float(state.get("tolerance", 1e-8)),
+        n_items=int(state.get("n_items", len(targets))),
+        sympy_ok=True, errors=errors,
+        tools_used=state.get("tools_used") or {},
+        llm_fallback_enabled=True,
+        macro_expansion_enabled=bool(state.get("macro_expansion_enabled")),
+        n_macros=int(state.get("n_macros", 0)),
+    )
+    report["metadata"]["judge_backend"] = "batch-ingest"
+    _write(out_path, report)
+    return report
+
+
 def run(
     *,
-    tex: str,
+    tex: str | None = None,
     out_path: Path,
-    seeds: int,
-    tolerance: float,
+    seeds: int = 3,
+    tolerance: float = 1e-8,
     per_equation_timeout_seconds: int = 5,
     max_equations: int = 500,
     use_macro_expansion: bool = True,
     use_llm_fallback: bool = True,
+    backend=None,
 ) -> dict[str, Any]:
+    # CC-bridge ingest: skip sympy re-run, just absorb LLM results.
+    if backend is not None and backend.mode == "batch-ingest":
+        state = _judge_backend.read_state(backend.state_file)
+        return _ingest_math_results(state, out_path, backend)
+
+    if tex is None:
+        raise ValueError("tex required for sdk / batch-emit modes")
+
+    emit_mode = backend is not None and backend.mode == "batch-emit"
+    if emit_mode:
+        _judge_backend.ensure_emit_args(backend)
+
     ok, err = _sympy_available()
     if not ok:
         # Distinguish env vs evidence at the top level. sympy missing or
@@ -724,6 +915,13 @@ def run(
         "sympy": 0, "sympy_with_macros": 0, "llm_fallback": 0, "none": 0,
     }
     llm_available = use_llm_fallback and _llm_available()
+    # In batch-emit mode the in-process LLM fallback is replaced by task
+    # emission. Pending targets collect here; the final state file and task
+    # JSONL are written after the main loop.
+    emit_tasks: list[dict[str, Any]] = []
+    emit_pending_targets: list[dict[str, Any]] = []
+    if emit_mode:
+        llm_available = False  # force the inline SDK path off
 
     if len(items) > max_equations:
         errors.append(
@@ -764,6 +962,15 @@ def run(
             expanded = (lhs != lhs_raw) or (rhs != rhs_raw)
 
             hits = unparseable_hits(lhs) + unparseable_hits(rhs) + body_hits
+            # Defensive: if an alignment-wrapper envelope somehow leaked past
+            # _strip_alignment_wrappers (nested beyond max_iterations, or an
+            # unknown wrapper env), detect the `\begin{` or `\end{` literal in
+            # either side and tag as unverifiable (tool gap) rather than let
+            # parse_latex read `aligned` as a*l*i*g*n*e*d.
+            if any(tok in lhs or tok in rhs
+                   for tok in (r"\begin{", r"\end{")):
+                if r"\begin{" not in hits:
+                    hits = hits + [r"\begin{"]
             if hits:
                 tgt = _skip_target(
                     idx, pair_idx, item,
@@ -778,16 +985,36 @@ def run(
                     tgt["evidence"]["macro_expanded"] = True
                 # Optional LLM fallback — only for tool-gap cases, not for
                 # legitimately-inconclusive evidence.
-                if llm_available:
+                if emit_mode and use_llm_fallback:
+                    task_id = f"math:{idx}:{pair_idx}"
+                    context = _collapse_ws(item["raw"])[:1200]
+                    emit_tasks.append(_judge_backend.build_task(
+                        task_id=task_id,
+                        verifier=VERIFIER_ID,
+                        target_locator=tgt["locator"],
+                        kind="math_llm_fallback",
+                        system=_LLM_MATH_SYSTEM,
+                        user=_math_llm_user_prompt(lhs, rhs, context),
+                        max_tokens=300, temperature=0, expected_format="json",
+                    ))
+                    pending = dict(tgt)
+                    pending["status"] = "pending_llm"
+                    pending["severity_suggestion"] = "major"
+                    pending["_task_id"] = task_id
+                    emit_pending_targets.append(pending)
+                    tools_used["llm_fallback"] += 1
+                elif llm_available:
                     context = _collapse_ws(item["raw"])[:1200]
                     jres = _llm_math_judge(lhs, rhs, context)
                     tgt["evidence"]["llm_judge"] = jres
                     _apply_llm_verdict(tgt, jres)
                     tools_used["llm_fallback"] += 1
+                    counts[tgt["status"]] = counts.get(tgt["status"], 0) + 1
+                    targets.append(tgt)
                 else:
                     tools_used["none"] += 1
-                counts[tgt["status"]] = counts.get(tgt["status"], 0) + 1
-                targets.append(tgt)
+                    counts[tgt["status"]] = counts.get(tgt["status"], 0) + 1
+                    targets.append(tgt)
                 continue
             try:
                 with _equation_timeout(per_equation_timeout_seconds):
@@ -833,7 +1060,30 @@ def run(
             detail["macro_expansion_note"] = macro_note
             detail["macro_expanded"] = expanded
             # If sympy failed to parse and LLM is available, consult LLM judge.
-            if (detail.get("parse_failed") or detail["status"] == "unverifiable") and llm_available:
+            need_llm = (detail.get("parse_failed")
+                        or detail["status"] == "unverifiable")
+            if need_llm and emit_mode and use_llm_fallback:
+                # Emit a task instead of inline-calling the SDK.
+                target = build_target(idx, item, pair_idx, detail)
+                task_id = f"math:{idx}:{pair_idx}"
+                context = _collapse_ws(item["raw"])[:1200]
+                emit_tasks.append(_judge_backend.build_task(
+                    task_id=task_id,
+                    verifier=VERIFIER_ID,
+                    target_locator=target["locator"],
+                    kind="math_llm_fallback",
+                    system=_LLM_MATH_SYSTEM,
+                    user=_math_llm_user_prompt(lhs, rhs, context),
+                    max_tokens=300, temperature=0, expected_format="json",
+                ))
+                pending = dict(target)
+                pending["status"] = "pending_llm"
+                pending["severity_suggestion"] = "major"
+                pending["_task_id"] = task_id
+                emit_pending_targets.append(pending)
+                tools_used["llm_fallback"] += 1
+                continue
+            if need_llm and llm_available:
                 context = _collapse_ws(item["raw"])[:1200]
                 jres = _llm_math_judge(lhs, rhs, context)
                 detail["llm_judge"] = jres
@@ -848,6 +1098,68 @@ def run(
             target = build_target(idx, item, pair_idx, detail)
             targets.append(target)
             counts[target["status"]] = counts.get(target["status"], 0) + 1
+
+    # Batch-emit finalization: persist state + tasks, write interim report.
+    if emit_mode:
+        _judge_backend.write_tasks(backend.tasks_out, emit_tasks)
+        pending_clean = [
+            {k: v for k, v in t.items() if not k.startswith("_")}
+            for t in emit_pending_targets
+        ]
+        state = {
+            "verifier_id": VERIFIER_ID,
+            "verifier_version": VERIFIER_VERSION,
+            "phase": "batch-emit",
+            "pending_targets": emit_pending_targets,
+            "final_targets": targets,
+            "errors": errors,
+            "tools_used": tools_used,
+            "tex_len": len(tex),
+            "seeds": seeds, "tolerance": tolerance,
+            "n_items": len(items),
+            "macro_expansion_enabled": use_macro_expansion and bool(macros),
+            "n_macros": len(macros),
+            "out_path": str(out_path),
+        }
+        _judge_backend.write_state(backend.state_file, state)
+
+        interim_targets = targets + pending_clean
+        interim_status = "pending_llm" if emit_pending_targets else (
+            "failed" if counts.get("failed") else
+            ("unverifiable" if counts.get("unverifiable") else "verified"))
+        severity = ("minor" if interim_status == "verified"
+                    else ("minor" if interim_status == "pending_llm" else "P0"))
+        interim = {
+            "verifier_id": VERIFIER_ID,
+            "verifier_version": VERIFIER_VERSION,
+            "status": interim_status,
+            "severity_suggestion": severity,
+            "summary": (
+                f"batch-emit: {len(emit_tasks)} LLM task(s) queued; "
+                f"{counts.get('verified',0)} verified + "
+                f"{counts.get('failed',0)} failed + "
+                f"{counts.get('unverifiable',0)} unverifiable (pre-LLM)"),
+            "targets": interim_targets,
+            "metadata": {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "cost_usd": 0.0, "model": None, "cached": False,
+                "judge_backend": "batch-emit",
+                "n_llm_tasks_emitted": len(emit_tasks),
+                "inputs": {
+                    "tex_chars": len(tex), "seeds": seeds, "tolerance": tolerance,
+                    "n_equations_extracted": len(items),
+                    "n_targets": len(interim_targets),
+                    "sympy_available": True,
+                    "llm_fallback_enabled": True,
+                    "macro_expansion_enabled": use_macro_expansion and bool(macros),
+                    "n_macros_extracted": len(macros),
+                },
+                "verifier_tools_used": tools_used,
+            },
+            "errors": errors,
+        }
+        _write(out_path, interim)
+        return interim
 
     if not targets:
         targets.append({
@@ -932,7 +1244,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Verify displayed-equation algebra via sympy symbolic + numerical checks.",
     )
-    parser.add_argument("--tex", required=True, type=Path, help="LaTeX file to parse")
+    parser.add_argument(
+        "--tex", type=Path,
+        help="LaTeX file to parse. Required for sdk/batch-emit modes; "
+             "optional in batch-ingest mode (state file carries context).",
+    )
     parser.add_argument("--out", required=True, type=Path, help="Output JSON path")
     parser.add_argument(
         "--seeds", type=int, default=3,
@@ -960,9 +1276,26 @@ def main() -> int:
               "ANTHROPIC_API_KEY is set (saves ~2k tokens per unresolved "
               "equation)."),
     )
+    if _judge_backend is not None:
+        _judge_backend.add_backend_args(parser)
     args = parser.parse_args()
 
-    if not args.tex.is_file():
+    # --tex is optional in batch-ingest mode (we read state instead).
+    parser_tex = getattr(args, "tex", None)
+    backend = _judge_backend.build_context(args) if _judge_backend is not None else None
+
+    if backend is not None and backend.mode == "batch-ingest":
+        report = run(
+            tex=None, out_path=args.out,
+            seeds=args.seeds, tolerance=args.tolerance,
+            use_llm_fallback=not args.no_llm_fallback,
+            backend=backend,
+        )
+        print(f"[{VERIFIER_ID}] {report['status'].upper()}: {report['summary']}")
+        return 7 if report["status"] == "pending_llm" else (
+            0 if report["status"] == "verified" else 1)
+
+    if parser_tex is None or not args.tex.is_file():
         print(f"error: tex file not found: {args.tex}", file=sys.stderr)
         return 2
     tex = args.tex.read_text(encoding="utf-8", errors="replace")
@@ -975,6 +1308,7 @@ def main() -> int:
         max_equations=args.max_equations,
         use_macro_expansion=not args.no_macro_expansion,
         use_llm_fallback=not args.no_llm_fallback,
+        backend=backend,
     )
     print(f"[{VERIFIER_ID}] {report['status'].upper()}: {report['summary']}")
     for t in report["targets"][:20]:

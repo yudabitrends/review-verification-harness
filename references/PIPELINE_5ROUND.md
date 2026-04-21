@@ -157,6 +157,18 @@ bash ~/.claude/skills/review-verification-harness/scripts/run_round.sh \
 
 Exit R1 when: `consolidated.json` is written and lists the P0 / major / minor findings grouped for triage.
 
+### R1 via Claude Code Max (no API key)
+
+When `ANTHROPIC_API_KEY` is not available but the session runs inside Claude Code, use the v0.4 CC-bridge orchestrator. LLM judgments are deferred to dispatched subagents that use the Claude Max session's own inference.
+
+1. `python3 ~/.claude/skills/review-verification-harness/scripts/cc_run_round.py \
+    paper.tex --bib paper.bib --workspace workspace/r1` emits LLM task manifests (exit 7).
+2. The CC session reads `scripts/cc_dispatch_template.md` and dispatches subagents in batches (≤10 tasks/batch), writing results to `workspace/r1/judge_results/*.results.jsonl`.
+3. `python3 scripts/cc_run_round.py --phase finalize --workspace workspace/r1` ingests results and finalizes each verifier.
+4. If exit 7 again (contradiction verifier emitted compare-phase tasks), repeat step 2 + 3 once more.
+
+This flow produces the same verifier JSONs as the API-key path; only the dispatcher differs.
+
 ---
 
 ## R2 — Targeted fix
